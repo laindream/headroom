@@ -34,3 +34,16 @@ def test_responses_ccr_keeps_chatgpt_oauth_requests_streaming() -> None:
 
 def test_responses_ccr_ignores_requests_without_retrieve_tool() -> None:
     assert not _should_buffer(tools=[_unrelated_tool()], is_chatgpt_auth=False)
+
+
+def test_responses_ccr_buffers_default_standalone_mcp_tool() -> None:
+    tool = {"type": _TOOL_TYPE_FUNCTION, "name": f"mcp__headroom__{CCR_TOOL_NAME}"}
+
+    assert _should_buffer(tools=[tool], is_chatgpt_auth=False)
+
+
+def test_responses_ccr_buffers_custom_mcp_tool_prefix(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+    tool = {"type": _TOOL_TYPE_FUNCTION, "name": f"custom-headroom::{CCR_TOOL_NAME}"}
+
+    assert _should_buffer(tools=[tool], is_chatgpt_auth=False)

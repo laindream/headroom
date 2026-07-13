@@ -58,6 +58,47 @@ def test_has_ccr_tool_calls_uses_provider_native_names() -> None:
     )
 
 
+def test_has_ccr_tool_calls_accepts_default_standalone_mcp_name() -> None:
+    response = {
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_1",
+                "name": f"mcp__headroom__{CCR_TOOL_NAME}",
+                "input": {"hash": HASH},
+            }
+        ]
+    }
+
+    assert has_ccr_tool_calls(response, "anthropic")
+    ccr_calls, other_calls = parse_ccr_tool_calls(response, "anthropic")
+    assert ccr_calls == [CCRToolCall(tool_call_id="tool_1", hash_key=HASH)]
+    assert other_calls == []
+
+
+def test_has_ccr_tool_calls_accepts_custom_mcp_prefix(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": f"custom-headroom::{CCR_TOOL_NAME}",
+                                "arguments": '{"hash":"abc123def456abc123def456"}',
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    assert has_ccr_tool_calls(response, "openai")
+
+
 def test_parse_ccr_tool_calls_splits_retrievals_from_other_tools() -> None:
     response = {
         "content": [

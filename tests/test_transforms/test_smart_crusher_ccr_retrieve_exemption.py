@@ -103,6 +103,34 @@ class TestHeadroomRetrieveExemptionOpenAI:
         # Content should have been modified (compressed)
         assert tool_msg["content"] != content or result.tokens_after <= result.tokens_before
 
+    def test_custom_prefixed_retrieve_result_not_compressed(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+        content = _big_content()
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_custom_ccr",
+                        "function": {
+                            "name": "custom-headroom::headroom_retrieve",
+                            "arguments": '{"hash":"abc"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_custom_ccr",
+                "content": content,
+            },
+        ]
+
+        result = _make_crusher(min_tokens=0).apply(messages, _get_tokenizer())
+
+        assert result.messages[1]["content"] == content
+        assert not any("smart_crush" in transform for transform in result.transforms_applied)
+
 
 class TestHeadroomRetrieveExemptionAnthropic:
     """Anthropic-style tool_result content blocks from headroom_retrieve must not be crushed."""

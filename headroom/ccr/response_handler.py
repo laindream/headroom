@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
+from ..mcp_tool_names import accepted_headroom_mcp_tool_names
 from .tool_calls import (
     CCRToolCall,
     extract_tool_calls,
@@ -507,7 +508,6 @@ class StreamingCCRBuffer:
 
     # Patterns to detect tool_use in stream
     _tool_use_start: bytes = b'"type":"tool_use"'
-    _ccr_tool_pattern: bytes = f'"{CCR_TOOL_NAME}"'.encode()
 
     def add_chunk(self, chunk: bytes) -> bool:
         """Add a chunk and check for CCR tool calls.
@@ -520,7 +520,12 @@ class StreamingCCRBuffer:
         # Quick check: does accumulated content contain CCR tool?
         accumulated = b"".join(self.chunks)
 
-        if self._tool_use_start in accumulated and self._ccr_tool_pattern in accumulated:
+        ccr_tool_patterns = tuple(
+            f'"{name}"'.encode() for name in accepted_headroom_mcp_tool_names(CCR_TOOL_NAME)
+        )
+        if self._tool_use_start in accumulated and any(
+            pattern in accumulated for pattern in ccr_tool_patterns
+        ):
             self.detected_ccr = True
             return True
 

@@ -43,6 +43,29 @@ def _sse_json_events(chunks: list[bytes]) -> list[dict[str, Any]]:
     return events
 
 
+def test_streaming_ccr_buffer_detects_default_standalone_mcp_name() -> None:
+    buffer = StreamingCCRBuffer()
+    chunk = (
+        b'{"type":"content_block_start","content_block":'
+        b'{"type":"tool_use","name":"mcp__headroom__headroom_retrieve"}}'
+    )
+
+    assert buffer.add_chunk(chunk)
+
+
+def test_streaming_ccr_buffer_detects_custom_mcp_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+    buffer = StreamingCCRBuffer()
+    chunk = (
+        b'{"type":"content_block_start","content_block":'
+        b'{"type":"tool_use","name":"custom-headroom::headroom_retrieve"}}'
+    )
+
+    assert buffer.add_chunk(chunk)
+
+
 def test_extract_tool_calls_google_and_invalid_shapes() -> None:
     handler = CCRResponseHandler()
     google_response = {

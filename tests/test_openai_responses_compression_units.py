@@ -399,6 +399,53 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
     assert strategy_chain == []
 
 
+def test_openai_responses_adapter_preserves_custom_prefixed_retrieve_outputs(monkeypatch):
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed retrieve output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    retrieved = " ".join(f"retrieved{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_retrieve",
+                "name": "custom-headroom::headroom_retrieve",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_retrieve",
+                "output": retrieved,
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert transforms == []
+    assert new_payload == payload
+    assert units_by_category == {}
+    assert strategy_chain == []
+
+
 def test_openai_responses_adapter_preserves_excluded_tool_outputs():
     """Regression for #940: outputs for HEADROOM_EXCLUDE_TOOLS tools stay raw.
 

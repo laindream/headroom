@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.mcp_tool_names import (
+    HEADROOM_RETRIEVE_TOOL_NAME,
+    is_headroom_mcp_tool_name,
+)
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -692,7 +696,10 @@ class StreamingMixin:
                 continue
             if block.get("type") != "tool_use":
                 continue
-            if block.get("name") != "headroom_retrieve":
+            if not is_headroom_mcp_tool_name(
+                block.get("name"),
+                HEADROOM_RETRIEVE_TOOL_NAME,
+            ):
                 continue
 
             input_data = block.get("input", {})
@@ -763,7 +770,10 @@ class StreamingMixin:
 
         store = get_compression_store()
         for slot in tool_calls.values():
-            if slot["name"] != "headroom_retrieve":
+            if not is_headroom_mcp_tool_name(
+                slot["name"],
+                HEADROOM_RETRIEVE_TOOL_NAME,
+            ):
                 continue
             try:
                 input_data = json.loads(slot["args_buf"]) if slot["args_buf"] else {}

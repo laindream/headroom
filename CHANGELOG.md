@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- Headroom now recognizes its bare MCP tool names and, by default, Claude Code's
+  standalone `mcp__headroom__*` names consistently across CCR availability,
+  duplicate-injection prevention, response handling, streaming feedback, and
+  retrieved-output protection. Set `HEADROOM_MCP_TOOL_PREFIX` when a host uses a
+  different exact model-visible prefix; the configured prefix replaces the
+  standalone default without enabling unsafe suffix matching.
 - The dashboard's per-request metadata (the `recent_requests` / `request_logs`
   tail and the `config` block with upstream URLs) is gated to loopback callers
   via `_request_is_loopback`. When Headroom runs in a bridge-network container

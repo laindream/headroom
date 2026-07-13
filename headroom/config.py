@@ -9,6 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
+from headroom.mcp_tool_names import HEADROOM_MCP_TOOL_NAMES, is_headroom_mcp_tool_name
 from headroom.models.config import ML_MODEL_DEFAULTS
 
 
@@ -233,6 +234,11 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
     """Return equivalent spellings for tool exclusion matching."""
     aliases = [name]
     lname = name.lower()
+
+    for tool_name in HEADROOM_MCP_TOOL_NAMES:
+        if is_headroom_mcp_tool_name(name, tool_name):
+            aliases.append(tool_name)
+            break
 
     if lname.startswith("mcp__"):
         # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that

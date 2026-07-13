@@ -1003,9 +1003,24 @@ def test_cache_mode_existing_retrieve_tool_keeps_exact_prefix_replay(monkeypatch
         assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "mcp_tool_prefix"),
+    [
+        ("headroom_retrieve", None),
+        ("mcp__headroom__headroom_retrieve", None),
+        (
+            "mcp__plugin_headroom_headroom__headroom_retrieve",
+            "mcp__plugin_headroom_headroom__",
+        ),
+    ],
+)
 def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
     monkeypatch,
+    tool_name,
+    mcp_tool_prefix,
 ) -> None:
+    if mcp_tool_prefix is not None:
+        monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", mcp_tool_prefix)
     captured: dict[str, object] = {}
     original_messages = [
         {"role": "user", "content": "prefix raw content"},
@@ -1018,7 +1033,7 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
         }
     ]
     existing_tool = {
-        "name": "headroom_retrieve",
+        "name": tool_name,
         "description": "Retrieve compressed content",
         "input_schema": {"type": "object", "properties": {}},
     }
@@ -1120,7 +1135,7 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
                 ),
             },
         ]
-        assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
+        assert [tool["name"] for tool in forwarded["tools"]] == [tool_name]
 
 
 def test_non_token_non_cache_mode_preserves_original_messages_when_result_is_unchanged(

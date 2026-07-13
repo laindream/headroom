@@ -154,6 +154,27 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. If `http://127.0.0.1:<port>/mcp` returns `404`, use the stdio configuration above.
 
+### Model-visible tool prefix
+
+The proxy recognizes both Headroom's bare tool names and Claude Code's standalone
+MCP names. The default model-visible prefix is `mcp__headroom__`, so
+`mcp__headroom__headroom_retrieve` is treated as the same tool as
+`headroom_retrieve`.
+
+If an MCP host exposes Headroom under another prefix, set the exact prefix on the
+proxy process:
+
+```bash
+HEADROOM_MCP_TOOL_PREFIX=mcp__plugin_headroom_headroom__ headroom proxy
+```
+
+The configured prefix replaces the standalone default; bare Headroom tool names
+remain valid. An empty value falls back to the standalone default. Matching is
+exact: Headroom does not accept arbitrary suffix matches.
+The stdio MCP protocol itself still uses the advertised bare names such as
+`headroom_retrieve`; this setting only controls recognition of names visible to
+the model and provider APIs.
+
 ### `command: "headroom"` fails to start
 
 The configurations above use `"command": "headroom"`, which only works if the `headroom`

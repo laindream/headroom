@@ -18,8 +18,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.mcp_tool_names import (
+    HEADROOM_RETRIEVE_TOOL_NAME,
+    is_headroom_mcp_tool_name,
+)
+
 # Tool name constant - used for matching tool calls
-CCR_TOOL_NAME = "headroom_retrieve"
+CCR_TOOL_NAME = HEADROOM_RETRIEVE_TOOL_NAME
 
 
 def create_ccr_tool_definition(
@@ -332,7 +337,7 @@ class CCRToolInjector:
         # Check if already present (e.g., from MCP server)
         for tool in tools:
             tool_name = tool.get("name") or tool.get("function", {}).get("name")
-            if tool_name == CCR_TOOL_NAME:
+            if is_headroom_mcp_tool_name(tool_name, CCR_TOOL_NAME):
                 return tools, False  # Already present, skip injection
 
         # Add CCR tool
@@ -489,7 +494,7 @@ def parse_tool_call(
         name = tool_call.get("name")
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
-    if name != CCR_TOOL_NAME:
+    if not is_headroom_mcp_tool_name(name, CCR_TOOL_NAME):
         return None
 
     # A CCR-named tool call whose decoded arguments/input are not an object

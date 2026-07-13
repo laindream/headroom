@@ -120,6 +120,36 @@ def test_mcp_stats_surfaces_unreachable_proxy() -> None:
     assert "unreachable" in payload["warning"].lower()
 
 
+def test_mcp_dispatch_accepts_custom_tool_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    calls = 0
+
+    async def handle_stats():
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(server, "_handle_stats", handle_stats)
+
+    response = asyncio.run(server.server.call_tool_handler("custom-headroom::headroom_stats", {}))
+
+    assert response == []
+    assert calls == 1
+
+
+def test_mcp_dispatch_rejects_unconfigured_tool_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "custom-headroom::")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    response = asyncio.run(server.server.call_tool_handler("mcp__other__headroom_stats", {}))
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload == {"error": "Unknown tool: mcp__other__headroom_stats"}
+
+
 def test_mcp_proxy_probe_preserves_shared_proxy_client(monkeypatch: pytest.MonkeyPatch) -> None:
     class ProbeResponse:
         status_code = 200

@@ -2211,6 +2211,7 @@ def apply_session_sticky_ccr_tool(
     fresh list (caller-safe).
     """
     from headroom.ccr.tool_injection import CCR_TOOL_NAME
+    from headroom.mcp_tool_names import is_headroom_mcp_tool_name
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
@@ -2223,7 +2224,7 @@ def apply_session_sticky_ccr_tool(
             existing_names.add(n)
 
     # Client (or MCP) already provided a tool by this name — don't double up.
-    if CCR_TOOL_NAME in existing_names:
+    if any(is_headroom_mcp_tool_name(name, CCR_TOOL_NAME) for name in existing_names):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,

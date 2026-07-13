@@ -721,16 +721,20 @@ def _has_headroom_retrieve_tool_responses(tools: Any) -> bool:
     Mirrors ``AnthropicHandler._has_headroom_retrieve_tool``.
     """
     from headroom.ccr import CCR_TOOL_NAME
+    from headroom.mcp_tool_names import is_headroom_mcp_tool_name
 
     if not isinstance(tools, list):
         return False
     for tool in tools:
         if not isinstance(tool, dict):
             continue
-        if tool.get("name") == CCR_TOOL_NAME:
+        if is_headroom_mcp_tool_name(tool.get("name"), CCR_TOOL_NAME):
             return True
         function = tool.get("function")
-        if isinstance(function, dict) and function.get("name") == CCR_TOOL_NAME:
+        if isinstance(function, dict) and is_headroom_mcp_tool_name(
+            function.get("name"),
+            CCR_TOOL_NAME,
+        ):
             return True
     return False
 
@@ -1311,6 +1315,11 @@ class OpenAIHandlerMixin:
                 item["output"] = replacement
 
         headroom_retrieve_call_ids: set[str] = set()
+        from headroom.mcp_tool_names import (
+            HEADROOM_RETRIEVE_TOOL_NAME,
+            is_headroom_mcp_tool_name,
+        )
+
         # Map each Responses tool call to its name so that outputs belonging to
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
@@ -1327,9 +1336,7 @@ class OpenAIHandlerMixin:
             call_id = item.get("call_id")
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
-            if isinstance(name, str) and (
-                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
-            ):
+            if is_headroom_mcp_tool_name(name, HEADROOM_RETRIEVE_TOOL_NAME):
                 if isinstance(call_id, str) and call_id:
                     headroom_retrieve_call_ids.add(call_id)
 

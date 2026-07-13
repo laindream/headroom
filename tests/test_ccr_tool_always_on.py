@@ -204,6 +204,26 @@ def test_existing_ccr_tool_in_client_list_skips_injection():
     assert names.count(CCR_TOOL_NAME) == 1
 
 
+def test_existing_standalone_mcp_tool_in_client_list_skips_injection():
+    """The default model-visible MCP spelling is the same logical CCR tool."""
+    client_tool = {
+        "name": f"mcp__headroom__{CCR_TOOL_NAME}",
+        "description": "client-provided",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    }
+
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id="sess-with-standalone-mcp",
+        request_id="r1",
+        existing_tools=[client_tool],
+        has_compressed_content_this_turn=True,
+    )
+
+    assert injected is False
+    assert tools == [client_tool]
+
+
 def test_no_session_id_falls_back_to_per_turn_decision():
     """WS / pre-session paths with no session_id behave per-turn."""
     # No fresh CCR + no session_id → no inject.

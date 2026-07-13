@@ -35,6 +35,13 @@ from typing import Any
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.mcp_tool_names import (
+    HEADROOM_COMPRESS_TOOL_NAME,
+    HEADROOM_READ_TOOL_NAME,
+    HEADROOM_RETRIEVE_TOOL_NAME,
+    HEADROOM_STATS_TOOL_NAME,
+    is_headroom_mcp_tool_name,
+)
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -68,10 +75,10 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
-CCR_TOOL_NAME = "headroom_retrieve"
-COMPRESS_TOOL_NAME = "headroom_compress"
-STATS_TOOL_NAME = "headroom_stats"
-READ_TOOL_NAME = "headroom_read"
+CCR_TOOL_NAME = HEADROOM_RETRIEVE_TOOL_NAME
+COMPRESS_TOOL_NAME = HEADROOM_COMPRESS_TOOL_NAME
+STATS_TOOL_NAME = HEADROOM_STATS_TOOL_NAME
+READ_TOOL_NAME = HEADROOM_READ_TOOL_NAME
 
 logger = logging.getLogger("headroom.ccr.mcp")
 
@@ -705,13 +712,13 @@ class HeadroomMCPServer:
                 json.dumps(arguments, ensure_ascii=False, default=str),
             )
             try:
-                if name == COMPRESS_TOOL_NAME:
+                if is_headroom_mcp_tool_name(name, COMPRESS_TOOL_NAME):
                     result = await self._handle_compress(arguments)
-                elif name == CCR_TOOL_NAME:
+                elif is_headroom_mcp_tool_name(name, CCR_TOOL_NAME):
                     result = await self._handle_retrieve(arguments)
-                elif name == STATS_TOOL_NAME:
+                elif is_headroom_mcp_tool_name(name, STATS_TOOL_NAME):
                     result = await self._handle_stats()
-                elif name == READ_TOOL_NAME and _READ_ENABLED:
+                elif is_headroom_mcp_tool_name(name, READ_TOOL_NAME) and _READ_ENABLED:
                     result = await self._handle_read(arguments)
                 else:
                     result = [

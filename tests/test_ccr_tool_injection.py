@@ -203,6 +203,30 @@ class TestCCRToolInjector:
         assert not was_injected
         assert len(tools) == 1
 
+    def test_skip_injection_if_default_standalone_mcp_tool_present(self):
+        """The model-visible standalone MCP name must not trigger a duplicate tool."""
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    "[100 items compressed to 10. Retrieve more: hash=bbc456789012bbc456789012]"
+                ),
+            },
+        ]
+        existing_tools = [
+            {
+                "name": f"mcp__headroom__{CCR_TOOL_NAME}",
+                "input_schema": {},
+            }
+        ]
+
+        injector = CCRToolInjector(provider="anthropic")
+        injector.scan_for_markers(messages)
+        tools, was_injected = injector.inject_tool_definition(existing_tools)
+
+        assert not was_injected
+        assert tools == existing_tools
+
     def test_no_injection_without_compression(self):
         """No injection when no compression markers found."""
         messages = [

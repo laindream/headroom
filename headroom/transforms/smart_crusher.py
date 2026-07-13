@@ -53,6 +53,7 @@ from typing import Any
 
 from ..ccr.tool_injection import CCR_TOOL_NAME
 from ..config import CCRConfig, TransformResult
+from ..mcp_tool_names import is_headroom_mcp_tool_name
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
@@ -1280,7 +1281,10 @@ class SmartCrusher(Transform):
                 # unresolvable retrieval loop.
                 # ponytail: ceiling is tool_call_id lookup; if the id is missing we
                 # compress (conservative: unknown tool names don't get a free pass).
-                if tool_names_by_id.get(msg.get("tool_call_id") or "") == CCR_TOOL_NAME:
+                if is_headroom_mcp_tool_name(
+                    tool_names_by_id.get(msg.get("tool_call_id") or ""),
+                    CCR_TOOL_NAME,
+                ):
                     continue
                 content = msg.get("content", "")
                 if isinstance(content, str):
@@ -1310,7 +1314,10 @@ class SmartCrusher(Transform):
                     # would produce a new <<ccr:hash>> marker the agent cannot
                     # redeem (infinite retrieval loop).
                     # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
-                    if tool_names_by_id.get(block.get("tool_use_id") or "") == CCR_TOOL_NAME:
+                    if is_headroom_mcp_tool_name(
+                        tool_names_by_id.get(block.get("tool_use_id") or ""),
+                        CCR_TOOL_NAME,
+                    ):
                         continue
                     tool_content = block.get("content", "")
                     if not isinstance(tool_content, str):

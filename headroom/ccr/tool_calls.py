@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.mcp_tool_names import is_headroom_mcp_tool_name
+
 from .tool_injection import CCR_TOOL_NAME, parse_tool_call
 
 
@@ -72,9 +74,15 @@ def extract_tool_calls(response: dict[str, Any], provider: str) -> list[dict[str
 def is_ccr_tool_call(tool_call: dict[str, Any]) -> bool:
     """Return true when a provider-native tool call names the CCR retrieval tool."""
     return (
-        tool_call.get("name") == CCR_TOOL_NAME
-        or tool_call.get("function", {}).get("name") == CCR_TOOL_NAME
-        or tool_call.get("functionCall", {}).get("name") == CCR_TOOL_NAME
+        is_headroom_mcp_tool_name(tool_call.get("name"), CCR_TOOL_NAME)
+        or is_headroom_mcp_tool_name(
+            tool_call.get("function", {}).get("name"),
+            CCR_TOOL_NAME,
+        )
+        or is_headroom_mcp_tool_name(
+            tool_call.get("functionCall", {}).get("name"),
+            CCR_TOOL_NAME,
+        )
     )
 
 

@@ -185,15 +185,21 @@ class AnthropicHandlerMixin:
     @staticmethod
     def _has_headroom_retrieve_tool(tools: Any) -> bool:
         """Return True when the final Anthropic tool list includes CCR retrieve."""
+        from headroom.ccr.tool_injection import CCR_TOOL_NAME
+        from headroom.mcp_tool_names import is_headroom_mcp_tool_name
+
         if not isinstance(tools, list):
             return False
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
-            if tool.get("name") == "headroom_retrieve":
+            if is_headroom_mcp_tool_name(tool.get("name"), CCR_TOOL_NAME):
                 return True
             function = tool.get("function")
-            if isinstance(function, dict) and function.get("name") == "headroom_retrieve":
+            if isinstance(function, dict) and is_headroom_mcp_tool_name(
+                function.get("name"),
+                CCR_TOOL_NAME,
+            ):
                 return True
         return False
 
@@ -1216,6 +1222,7 @@ class AnthropicHandlerMixin:
 
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
                     from headroom.ccr.tool_injection import CCR_TOOL_NAME
+                    from headroom.mcp_tool_names import is_headroom_mcp_tool_name
 
                     existing_tool_names = {
                         tool.get("name") or tool.get("function", {}).get("name")
@@ -1232,7 +1239,10 @@ class AnthropicHandlerMixin:
                         return (
                             self.config.ccr_inject_tool
                             and current_frozen_message_count > 0
-                            and CCR_TOOL_NAME not in existing_tool_names
+                            and not any(
+                                is_headroom_mcp_tool_name(name, CCR_TOOL_NAME)
+                                for name in existing_tool_names
+                            )
                         )
 
                     if is_token_mode(self.config.mode):
