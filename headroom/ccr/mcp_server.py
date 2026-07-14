@@ -93,6 +93,19 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 )
 
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+PROXY_STATS_TIMEOUT_ENV = "HEADROOM_MCP_PROXY_STATS_TIMEOUT_SECONDS"
+PROXY_LIVENESS_TIMEOUT_ENV = "HEADROOM_MCP_PROXY_LIVENESS_TIMEOUT_SECONDS"
+
+
+def _positive_timeout_seconds(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _format_session_summary(
@@ -275,6 +288,40 @@ def _build_proxy_unreachable_payload(
     if http_status is not None:
         payload["http_status"] = http_status
     return payload
+
+
+def _build_proxy_degraded_payload(
+    *,
+    proxy_url: str,
+    error: str,
+    http_status: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "url": proxy_url,
+        "status": "degraded",
+        "error": error,
+        "warning": (
+            f"Configured proxy {proxy_url} is running slowly or unhealthy; "
+            f"proxy statistics are temporarily unavailable ({error})."
+        ),
+    }
+    if http_status is not None:
+        payload["http_status"] = http_status
+    return payload
+
+
+def _proxy_exception_payload(proxy_url: str, exc: Exception) -> dict[str, Any]:
+    error = f"{type(exc).__name__}: {exc}"
+    if HTTPX_AVAILABLE and isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return _build_proxy_unreachable_payload(proxy_url=proxy_url, error=error)
+    http_status = None
+    if HTTPX_AVAILABLE and isinstance(exc, httpx.HTTPStatusError):
+        http_status = exc.response.status_code
+    return _build_proxy_degraded_payload(
+        proxy_url=proxy_url,
+        error=error,
+        http_status=http_status,
+    )
 
 
 @dataclass
@@ -554,17 +601,15 @@ class HeadroomMCPServer:
         return result
 
     async def _probe_proxy_unreachable(self) -> dict[str, Any] | None:
-        """Return explicit proxy-unreachable state when the configured proxy is down."""
+        """Return explicit proxy failure state without conflating slowness with absence."""
         if not self.check_proxy or not HTTPX_AVAILABLE:
             return None
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            timeout = _positive_timeout_seconds(PROXY_LIVENESS_TIMEOUT_ENV, 5.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.get(f"{self.proxy_url}/livez")
         except Exception as exc:
-            return _build_proxy_unreachable_payload(
-                proxy_url=self.proxy_url,
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            return _proxy_exception_payload(self.proxy_url, exc)
         if response.status_code != 200:
             detail = None
             try:
@@ -578,7 +623,7 @@ class HeadroomMCPServer:
             error = f"HTTP {response.status_code}"
             if detail:
                 error = f"{error} ({detail})"
-            return _build_proxy_unreachable_payload(
+            return _build_proxy_degraded_payload(
                 proxy_url=self.proxy_url,
                 error=error,
                 http_status=response.status_code,
@@ -586,19 +631,19 @@ class HeadroomMCPServer:
         try:
             payload = response.json()
         except Exception as exc:
-            return _build_proxy_unreachable_payload(
+            return _build_proxy_degraded_payload(
                 proxy_url=self.proxy_url,
                 error=f"invalid /livez payload: {type(exc).__name__}: {exc}",
                 http_status=response.status_code,
             )
         if not isinstance(payload, dict):
-            return _build_proxy_unreachable_payload(
+            return _build_proxy_degraded_payload(
                 proxy_url=self.proxy_url,
                 error="invalid /livez payload",
                 http_status=response.status_code,
             )
         if payload.get("status") != "healthy" or payload.get("alive") is not True:
-            return _build_proxy_unreachable_payload(
+            return _build_proxy_degraded_payload(
                 proxy_url=self.proxy_url,
                 error=f"proxy reported {payload.get('status', 'unhealthy')}",
                 http_status=response.status_code,
@@ -871,7 +916,12 @@ class HeadroomMCPServer:
 
         # Fetch proxy stats and format summary if proxy is reachable
         if self.check_proxy and HTTPX_AVAILABLE:
-            proxy_data = await self._fetch_full_proxy_stats()
+            proxy_status = None
+            try:
+                proxy_data = await self._fetch_full_proxy_stats()
+            except Exception as exc:
+                proxy_data = None
+                proxy_status = _proxy_exception_payload(self.proxy_url, exc)
             if proxy_data:
                 summary = proxy_data.get("summary")
                 if summary:
@@ -889,7 +939,8 @@ class HeadroomMCPServer:
                 if proxy_stats:
                     stats["proxy"] = proxy_stats
             else:
-                proxy_status = await self._probe_proxy_unreachable()
+                if proxy_status is None:
+                    proxy_status = await self._probe_proxy_unreachable()
                 if proxy_status:
                     stats["proxy"] = proxy_status
                     stats["warning"] = proxy_status["warning"]
@@ -898,16 +949,20 @@ class HeadroomMCPServer:
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""
-        try:
-            if self._http_client is None:
-                self._http_client = httpx.AsyncClient(timeout=15.0)
-            response = await self._http_client.get(f"{self.proxy_url}/stats")
-            if response.status_code != 200:
-                return None
-            result: dict[str, Any] = response.json()
-            return result
-        except Exception:
-            return None
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=15.0)
+        timeout = _positive_timeout_seconds(PROXY_STATS_TIMEOUT_ENV, 15.0)
+        response = await self._http_client.get(
+            f"{self.proxy_url}/stats?cached=1",
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            response.raise_for_status()
+            raise RuntimeError(f"proxy stats returned HTTP {response.status_code}")
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("proxy stats returned a non-object JSON payload")
+        return result
 
     @staticmethod
     def _extract_proxy_stats(data: dict[str, Any]) -> dict[str, Any] | None:

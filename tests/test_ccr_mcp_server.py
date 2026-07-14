@@ -194,6 +194,80 @@ def test_mcp_proxy_probe_preserves_shared_proxy_client(monkeypatch: pytest.Monke
     assert server._http_client is shared_client
 
 
+def test_mcp_proxy_probe_reports_read_timeout_as_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProbeClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> ProbeClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            pass
+
+        async def get(self, _url: str):
+            raise mcp_server.httpx.ReadTimeout("busy")
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", ProbeClient)
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+
+    result = asyncio.run(server._probe_proxy_unreachable())
+
+    assert result is not None
+    assert result["status"] == "degraded"
+    assert "unreachable" not in result["warning"].lower()
+
+
+def test_mcp_stats_reports_stats_timeout_as_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+
+    async def fetch_stats():
+        raise mcp_server.httpx.ReadTimeout("stats busy")
+
+    monkeypatch.setattr(server, "_fetch_full_proxy_stats", fetch_stats)
+
+    response = asyncio.run(server._handle_stats())
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload["proxy"]["status"] == "degraded"
+    assert "unreachable" not in payload["warning"].lower()
+
+
+def test_mcp_stats_uses_dedicated_configurable_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class StatsResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"summary": {"mode": "cache"}}
+
+    class SharedClient:
+        async def get(self, url: str, *, timeout: float):
+            seen["url"] = url
+            seen["timeout"] = timeout
+            return StatsResponse()
+
+    monkeypatch.setenv("HEADROOM_MCP_PROXY_STATS_TIMEOUT_SECONDS", "42")
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._http_client = SharedClient()  # type: ignore[assignment]
+
+    result = asyncio.run(server._fetch_full_proxy_stats())
+
+    assert result == {"summary": {"mode": "cache"}}
+    assert seen == {
+        "url": "http://127.0.0.1:8787/stats?cached=1",
+        "timeout": 42.0,
+    }
+
+
 def test_mcp_local_mode_still_works_without_proxy_checking(fresh_store) -> None:
     server = mcp_server.HeadroomMCPServer(
         proxy_url="http://127.0.0.1:9",
