@@ -187,6 +187,7 @@ from headroom.transforms import (
     TransformPipeline,
     is_tree_sitter_available,
 )
+from headroom.transforms.kompress_compressor import get_kompress_execution_stats
 
 AnyLLMBackend: Any = None
 LiteLLMBackend: Any = None
@@ -1350,7 +1351,10 @@ class HeadroomProxy(
                 return "available"  # Available but not enabled
             return "disabled"
 
-    def _eager_preload_transforms(self) -> tuple[dict[str, str], list[dict[str, str]]]:
+    def _eager_preload_transforms(
+        self,
+        on_status: Callable[[dict[str, str]], None] | None = None,
+    ) -> tuple[dict[str, str], list[dict[str, str]]]:
         """Eagerly load every compressor/parser/detector once (dedup by ``id()``).
 
         Pure load: returns the merged ``eager_status`` plus the per-transform
@@ -1370,7 +1374,10 @@ class HeadroomProxy(
                 if not hasattr(transform, "eager_load_compressors"):
                     continue
                 try:
-                    transform_status = transform.eager_load_compressors()
+                    if isinstance(transform, ContentRouter) and on_status is not None:
+                        transform_status = transform.eager_load_compressors(on_status=on_status)
+                    else:
+                        transform_status = transform.eager_load_compressors()
                 except Exception as exc:
                     logger.warning(
                         "Eager preload failed for %s: %s",
@@ -1386,6 +1393,8 @@ class HeadroomProxy(
                 for key, value in transform_status.items():
                     eager_status.setdefault(key, value)
                 transform_statuses.append(transform_status)
+                if on_status is not None:
+                    on_status(transform_status)
         return eager_status, transform_statuses
 
     async def startup(self):
@@ -1460,6 +1469,7 @@ class HeadroomProxy(
 
         if self.config.optimize:
             logger.info("Pre-loading compressors and parsers...")
+
             # Run the preload OFF the event loop with a bound. The loop body
             # already swallows per-transform Exceptions, so the only thing that
             # can still block ASGI lifespan startup (and therefore the socket
@@ -1467,24 +1477,58 @@ class HeadroomProxy(
             # on Windows — the "never opens its port" failure in #790. Capping it
             # means startup always returns and uvicorn binds; on timeout the
             # transforms simply fall back to lazy loading on first use.
+            def _merge_transform_status(transform_status: dict[str, str]) -> None:
+                self.warmup.merge_transform_status(transform_status)
+                if transform_status.get("kompress") == "enabled":
+                    self._kompress_status = "enabled"
+
+            loop = asyncio.get_running_loop()
+
+            def _publish_transform_status(transform_status: dict[str, str]) -> None:
+                try:
+                    loop.call_soon_threadsafe(_merge_transform_status, transform_status)
+                except RuntimeError:
+                    # Event loop already closed during process shutdown.
+                    pass
+
+            preload_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._eager_preload_transforms,
+                    _publish_transform_status,
+                )
+            )
+            done, _pending = await asyncio.wait(
+                {preload_task},
+                timeout=EAGER_PRELOAD_TIMEOUT_SECONDS,
+            )
             transform_statuses: list[dict[str, str]] = []
-            try:
-                eager_status, transform_statuses = await asyncio.wait_for(
-                    asyncio.to_thread(self._eager_preload_transforms),
-                    timeout=EAGER_PRELOAD_TIMEOUT_SECONDS,
-                )
-            except Exception as exc:
+            if done:
+                try:
+                    eager_status, transform_statuses = preload_task.result()
+                except Exception as exc:
+                    logger.warning("Eager preload failed: %s", exc)
+                    eager_status = {}
+            else:
                 logger.warning(
-                    "Eager preload exceeded %.0fs or failed (%s); continuing so "
-                    "the proxy still binds — transforms load lazily on first use.",
+                    "Eager preload exceeded %.0fs; continuing so the proxy still binds. "
+                    "The preload worker remains active and publishes each completed status.",
                     EAGER_PRELOAD_TIMEOUT_SECONDS,
-                    exc,
                 )
-                eager_status, transform_statuses = {}, []
+                eager_status = {}
+
+                def _consume_preload_result(task: asyncio.Task) -> None:
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.warning("Background eager preload failed: %s", exc)
+
+                preload_task.add_done_callback(_consume_preload_result)
             # Merge warmup status on the main thread (WarmupRegistry is not
             # written off-thread).
             for transform_status in transform_statuses:
-                self.warmup.merge_transform_status(transform_status)
+                _merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
         if eager_status.get("kompress") == "enabled":
@@ -2373,6 +2417,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "leaked_threads_total": _comp_leaked,
                 "source": ("auto" if config.compression_max_workers is None else "explicit"),
             },
+            "kompress_execution": get_kompress_execution_stats(),
             "websocket_sessions": {
                 "active_sessions": ws_active_sessions,
                 "active_relay_tasks": ws_active_relay_tasks,

@@ -20,6 +20,7 @@ pytest.importorskip("fastapi")
 
 import headroom.proxy.server as server_mod
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.transforms.content_router import ContentRouter
 
 
 def _make_proxy(*, optimize: bool):
@@ -68,6 +69,23 @@ class _HangingTransform:
         return {"hang": "done"}
 
 
+class _ProgressThenHangingContentRouter(ContentRouter):
+    """Publishes Kompress before a later component stalls."""
+
+    def __init__(self, release: threading.Event):
+        self._release = release
+
+    def eager_load_compressors(self, on_status=None):
+        if on_status is not None:
+            on_status({"kompress": "enabled", "kompress_backend": "onnx"})
+        self._release.wait(timeout=30)
+        return {
+            "kompress": "enabled",
+            "kompress_backend": "onnx",
+            "magika": "enabled",
+        }
+
+
 class _FakePipeline:
     def __init__(self, transforms):
         self.transforms = transforms
@@ -100,6 +118,43 @@ async def test_startup_binds_despite_hung_preload(monkeypatch):
         elapsed = time.monotonic() - start
         # Returns shortly after the 0.3s preload timeout, far below the 30s hang.
         assert elapsed < 10
+    finally:
+        release.set()
+        await proxy.shutdown()
+
+
+async def test_startup_keeps_status_completed_before_later_preload_timeout(monkeypatch):
+    """A later hung transform must not erase an already-loaded Kompress model."""
+    monkeypatch.setattr(server_mod, "EAGER_PRELOAD_TIMEOUT_SECONDS", 0.1)
+    proxy = _make_proxy(optimize=True)
+    release = threading.Event()
+    proxy.anthropic_pipeline = _FakePipeline(
+        [_FastTransform({"kompress": "enabled"}), _HangingTransform(release)]
+    )
+    proxy.openai_pipeline = _FakePipeline([])
+
+    try:
+        await proxy.startup()
+        assert proxy.warmup.kompress.status == "loaded"
+        assert proxy._kompress_status == "enabled"
+    finally:
+        release.set()
+        await proxy.shutdown()
+
+
+async def test_startup_keeps_component_status_when_same_router_later_hangs(monkeypatch):
+    """ContentRouter progress must survive a later component preload stall."""
+    monkeypatch.setattr(server_mod, "EAGER_PRELOAD_TIMEOUT_SECONDS", 0.1)
+    proxy = _make_proxy(optimize=True)
+    release = threading.Event()
+    proxy.anthropic_pipeline = _FakePipeline([_ProgressThenHangingContentRouter(release)])
+    proxy.openai_pipeline = _FakePipeline([])
+
+    try:
+        await proxy.startup()
+        assert proxy.warmup.kompress.status == "loaded"
+        assert proxy.warmup.kompress.info["backend"] == "onnx"
+        assert proxy._kompress_status == "enabled"
     finally:
         release.set()
         await proxy.shutdown()

@@ -130,6 +130,9 @@ class WarmupRegistry:
         _apply(self.code_aware, status.get("code_aware"))
         _apply(self.tree_sitter, status.get("tree_sitter"))
         _apply(self.smart_crusher, status.get("smart_crusher"))
+        kompress_backend = status.get("kompress_backend")
+        if kompress_backend:
+            self.kompress.info["backend"] = kompress_backend
 
     def to_dict(self) -> dict[str, dict[str, Any]]:
         """Serialize the whole registry (for ``/debug/warmup``)."""

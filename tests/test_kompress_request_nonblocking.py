@@ -12,10 +12,54 @@ in a background daemon thread instead.
 from __future__ import annotations
 
 import threading
+import time
+
+import pytest
 
 from headroom.transforms import kompress_compressor as kc
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.kompress_compressor import KompressCompressor
+
+
+def test_onnx_forward_terminates_at_internal_deadline():
+    """One slow ORT forward requests cooperative termination at the deadline."""
+
+    class SlowSession:
+        def run(self, _outputs, _inputs, run_options=None):
+            assert run_options is not None
+            while not run_options.terminate:
+                time.sleep(0.005)
+            raise RuntimeError("terminated")
+
+    model = kc._OnnxModel(SlowSession())
+    started = time.monotonic()
+    before = kc.get_kompress_execution_stats()["inference_timeouts_total"]
+
+    with pytest.raises(kc.KompressInferenceTimeout):
+        model.get_scores([[1]], [[1]], timeout_seconds=0.05)
+
+    assert time.monotonic() - started < 0.5
+    assert kc.get_kompress_execution_stats()["inference_timeouts_total"] == before + 1
+
+
+def test_onnx_forward_cancels_watchdog_after_success():
+    """A completed run must not be terminated later by its stale watchdog."""
+
+    class FastSession:
+        run_options = None
+
+        def run(self, _outputs, _inputs, run_options=None):
+            self.run_options = run_options
+            return [[0.9]]
+
+    session = FastSession()
+    model = kc._OnnxModel(session)
+
+    assert model.get_scores([[1]], [[1]], timeout_seconds=0.03) == [0.9]
+    time.sleep(0.06)
+
+    assert session.run_options is not None
+    assert session.run_options.terminate is False
 
 
 def test_compress_cache_only_passes_through_without_network(monkeypatch):
@@ -199,7 +243,8 @@ def test_saturation_fail_open_does_not_hang_request(monkeypatch):
     assert after == before + 1
 
 
-def test_capacity_available_still_compresses(monkeypatch):
+@pytest.mark.parametrize("backend", ["onnx", "onnx_cpu", "onnx_coreml"])
+def test_capacity_available_still_compresses(monkeypatch, backend):
     """When execution semaphore capacity is available, compression is still attempted."""
 
     class _FakeEncoding(dict):
@@ -228,7 +273,7 @@ def test_capacity_available_still_compresses(monkeypatch):
     monkeypatch.setattr(
         kc,
         "_load_kompress",
-        lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), "onnx"),
+        lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), backend),
     )
 
     result = KompressCompressor().compress(" ".join(["word"] * 20), allow_download=False)

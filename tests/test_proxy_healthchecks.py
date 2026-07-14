@@ -90,6 +90,31 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     assert isinstance(config["pid"], int)
 
 
+def test_health_reports_loaded_kompress_backend(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    app.state.proxy.warmup.merge_transform_status(
+        {"kompress": "enabled", "kompress_backend": "onnx"}
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    kompress = response.json()["checks"]["kompress"]
+    assert kompress["ready"] is True
+    assert kompress["backend"] == "onnx"
+    execution = response.json()["runtime"]["kompress_execution"]
+    assert "inference_timeouts_total" in execution
+    assert "execution_timeout_skips_total" in execution
+
+
 def test_health_reports_agent_savings_config():
     config = ProxyConfig(
         optimize=False,

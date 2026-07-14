@@ -44,6 +44,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -2691,7 +2692,10 @@ class ContentRouter(Transform):
                 logger.debug("HTMLExtractor not available (install trafilatura)")
         return self._html_extractor
 
-    def eager_load_compressors(self) -> dict[str, str]:
+    def eager_load_compressors(
+        self,
+        on_status: Callable[[dict[str, str]], None] | None = None,
+    ) -> dict[str, str]:
         """Pre-load compressors at startup to avoid first-request latency.
 
         Call this during proxy startup to load models and parsers
@@ -2701,6 +2705,10 @@ class ContentRouter(Transform):
             Dict of component name -> status string for logging.
         """
         status: dict[str, str] = {}
+
+        def _publish_status() -> None:
+            if on_status is not None and status:
+                on_status(dict(status))
 
         # 1. ML text compressor: Kompress.
         #
@@ -2735,6 +2743,7 @@ class ContentRouter(Transform):
                         status["kompress_backend"] = str(backend)
             else:
                 status["kompress"] = "unavailable"
+        _publish_status()
 
         # 2. Magika content detector (avoids 100-200ms on first content detection)
         try:
@@ -2749,6 +2758,7 @@ class ContentRouter(Transform):
         except Exception as e:
             logger.debug("Magika pre-load skipped: %s", e)
             status["magika"] = "skipped"
+        _publish_status()
 
         # Surface which onnxruntime dylib the Rust detection chain will load.
         # On Windows `headroom._ort` pins ORT_DYLIB_PATH at import time; an
@@ -2805,11 +2815,13 @@ class ContentRouter(Transform):
                     status["tree_sitter"] = "skipped"
             else:
                 status["code_aware"] = "not installed"
+        _publish_status()
 
         # 4. SmartCrusher (lightweight init, but ensures import + TOIN ready)
         smart_crusher = self._get_smart_crusher()
         if smart_crusher:
             status["smart_crusher"] = "ready"
+        _publish_status()
 
         return status
 

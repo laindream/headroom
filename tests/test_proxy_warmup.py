@@ -76,6 +76,20 @@ def test_warmup_registry_merges_enabled_status_into_loaded():
     assert out["smart_crusher"]["status"] == "loaded"
 
 
+def test_warmup_registry_preserves_kompress_backend():
+    reg = WarmupRegistry()
+
+    reg.merge_transform_status(
+        {
+            "kompress": "enabled",
+            "kompress_backend": "onnx",
+        }
+    )
+
+    assert reg.kompress.status == "loaded"
+    assert reg.kompress.info["backend"] == "onnx"
+
+
 def test_warmup_registry_preserves_null_for_unavailable():
     reg = WarmupRegistry()
     reg.merge_transform_status({"kompress": "unavailable", "magika": "not installed"})

@@ -123,6 +123,10 @@ class KompressModelNotCached(RuntimeError):
     """
 
 
+class KompressInferenceTimeout(TimeoutError):
+    """Raised after ONNX Runtime is asked to stop a forward pass at its deadline."""
+
+
 # Model cache: model_id -> (model, tokenizer, backend)
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
@@ -132,6 +136,7 @@ _execution_semaphores_lock = threading.Lock()
 _execution_metrics_lock = threading.Lock()
 _execution_skip_counters: dict[str, int] = {
     "timeout": 0,
+    "inference_timeout": 0,
 }
 _execution_wait_seconds_total: dict[str, float] = {
     "timeout": 0.0,
@@ -197,6 +202,7 @@ def get_kompress_execution_stats() -> dict[str, int | float]:
         return {
             "execution_acquire_timeout_ms": int(_execution_wait_budget_seconds() * 1000),
             "execution_timeout_skips_total": _execution_skip_counters["timeout"],
+            "inference_timeouts_total": _execution_skip_counters["inference_timeout"],
             "execution_wait_seconds_total": _execution_wait_seconds_total["timeout"],
         }
 
@@ -455,24 +461,86 @@ class _OnnxModel:
     def __init__(self, session: Any):
         self._session = session
 
-    def get_scores(self, input_ids: Any, attention_mask: Any) -> Any:
+    def get_scores(
+        self,
+        input_ids: Any,
+        attention_mask: Any,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         """Return [batch, seq] scores via ONNX Runtime."""
         import numpy as np
 
-        scores = self._session.run(
-            ["final_scores"],
-            {
-                "input_ids": np.asarray(input_ids, dtype=np.int64),
-                "attention_mask": np.asarray(attention_mask, dtype=np.int64),
-            },
-        )
+        inputs = {
+            "input_ids": np.asarray(input_ids, dtype=np.int64),
+            "attention_mask": np.asarray(attention_mask, dtype=np.int64),
+        }
+        if timeout_seconds is None or timeout_seconds <= 0:
+            scores = self._session.run(["final_scores"], inputs)
+        else:
+            import onnxruntime as ort
+
+            run_options = ort.RunOptions()
+            timed_out = threading.Event()
+            state_lock = threading.Lock()
+            finished = False
+
+            def _terminate() -> None:
+                nonlocal finished
+                with state_lock:
+                    if finished:
+                        return
+                    timed_out.set()
+                    run_options.terminate = True
+
+            watchdog = threading.Timer(timeout_seconds, _terminate)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                scores = self._session.run(["final_scores"], inputs, run_options)
+                if timed_out.is_set():
+                    with _execution_metrics_lock:
+                        _execution_skip_counters["inference_timeout"] += 1
+                    logger.warning(
+                        "Kompress ONNX inference exceeded %.3fs; termination was requested",
+                        timeout_seconds,
+                    )
+                    raise KompressInferenceTimeout(
+                        f"ONNX inference exceeded {timeout_seconds:.3f}s"
+                    )
+            except Exception as exc:
+                if timed_out.is_set() and not isinstance(exc, KompressInferenceTimeout):
+                    with _execution_metrics_lock:
+                        _execution_skip_counters["inference_timeout"] += 1
+                    logger.warning(
+                        "Kompress ONNX inference exceeded %.3fs; termination was requested",
+                        timeout_seconds,
+                    )
+                    raise KompressInferenceTimeout(
+                        f"ONNX inference exceeded {timeout_seconds:.3f}s"
+                    ) from exc
+                raise
+            finally:
+                with state_lock:
+                    finished = True
+                watchdog.cancel()
         return scores[0]  # [batch, seq] numpy array
 
-    def get_keep_mask(self, input_ids: Any, attention_mask: Any) -> Any:
+    def get_keep_mask(
+        self,
+        input_ids: Any,
+        attention_mask: Any,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         """Return [batch, seq] boolean mask (score > 0.5)."""
         import numpy as np
 
-        scores = self.get_scores(input_ids, attention_mask)
+        scores = self.get_scores(
+            input_ids,
+            attention_mask,
+            timeout_seconds=timeout_seconds,
+        )
         return (np.array(scores) > 0.5).tolist()
 
 
@@ -989,7 +1057,7 @@ class KompressCompressor(Transform):
             model, tokenizer, backend = _load_kompress(
                 self.config.model_id, self.config.device, allow_download=allow_download
             )
-            is_onnx = backend == "onnx"
+            is_onnx = backend.startswith("onnx")
             device_type = _model_device_type(model, backend)
 
             if self._should_batch_single_content(model, backend):
@@ -1067,14 +1135,34 @@ class KompressCompressor(Transform):
                 with contextlib.ExitStack() as stack:
                     stack.callback(semaphore.release)
                     inference_started = time.perf_counter()
+                    inference_timeout = None
+                    if deadline_s and isinstance(model, _OnnxModel):
+                        inference_timeout = max(
+                            0.001,
+                            deadline_s - (inference_started - t_deadline),
+                        )
                     if target_ratio is not None:
-                        scores = model.get_scores(input_ids, attention_mask)
+                        if inference_timeout is not None:
+                            scores = model.get_scores(
+                                input_ids,
+                                attention_mask,
+                                timeout_seconds=inference_timeout,
+                            )
+                        else:
+                            scores = model.get_scores(input_ids, attention_mask)
                         if is_onnx:
                             score_list = scores[0]  # numpy: [seq_len]
                         else:
                             score_list = scores[0].cpu()
                     else:
-                        keep_mask = model.get_keep_mask(input_ids, attention_mask)
+                        if inference_timeout is not None:
+                            keep_mask = model.get_keep_mask(
+                                input_ids,
+                                attention_mask,
+                                timeout_seconds=inference_timeout,
+                            )
+                        else:
+                            keep_mask = model.get_keep_mask(input_ids, attention_mask)
                         if is_onnx:
                             mask_list = keep_mask[0]  # list of bools
                         else:
@@ -1295,7 +1383,7 @@ class KompressCompressor(Transform):
                     results[i] = self._passthrough(contents[i], len(word_lists[i]))
             return [r for r in results if r is not None]
 
-        is_onnx = backend == "onnx"
+        is_onnx = backend.startswith("onnx")
         device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
         inference_ms = 0.0
@@ -1484,7 +1572,7 @@ class KompressCompressor(Transform):
 
         model, _tokenizer, backend = _kompress_cache[model_id]
 
-        if backend == "onnx":
+        if backend.startswith("onnx"):
             return True  # ONNX CPU provider doesn't parallelize batch dim
         if backend == "pytorch":
             try:
