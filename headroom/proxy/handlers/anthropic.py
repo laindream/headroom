@@ -68,6 +68,37 @@ def _strip_index_from_content_blocks(content: Any) -> None:
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
+    async def _count_anthropic_request_tokens(
+        self,
+        body: dict[str, Any],
+        headers: dict[str, str],
+    ) -> int | None:
+        """Count a complete Anthropic request through the configured upstream.
+
+        This is deliberately fail-closed for cache-pressure decisions: callers
+        receive ``None`` on every transport, status, or payload error and must
+        preserve the cached prefix.
+        """
+        client = getattr(self, "http_client", None)
+        if client is None:
+            return None
+
+        url = f"{self.ANTHROPIC_API_URL.rstrip('/')}/v1/messages/count_tokens"
+        timeout = float(self.config.cache_pressure_count_timeout_seconds)
+        try:
+            response = await client.post(url, headers=headers, json=body, timeout=timeout)
+            response.raise_for_status()
+            value = response.json().get("input_tokens")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("invalid input_tokens")
+            return value
+        except Exception as exc:
+            logger.warning(
+                "Cache-pressure token count failed (%s); preserving cached prefix",
+                type(exc).__name__,
+            )
+            return None
+
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         """Resolve a tokenizer and count messages off the event loop.
 
@@ -1542,6 +1573,120 @@ class AnthropicHandlerMixin:
             _norm = normalize_message_cache_control(optimized_messages)
             if _norm is not optimized_messages:
                 optimized_messages = _norm
+
+            # Cache-pressure escalation: cache mode remains the steady state,
+            # but once the exact request that would be forwarded approaches the
+            # model limit, evaluate one full-history token-mode candidate. Run
+            # this AFTER cached-prefix overlay so the baseline is the request the
+            # provider would actually see. An accepted candidate deliberately
+            # supersedes that overlay for one request; update_from_response later
+            # records the new forwarded prefix for subsequent cache-mode turns.
+            if (
+                self.config.cache_pressure_token_mode_enabled
+                and is_cache_mode(self.config.mode)
+                and _decision.should_compress
+                and not _skip_compression_for_backpressure
+                and not _bypass
+                and upstream_base_url is None
+                and getattr(self, "anthropic_backend", None) is None
+            ):
+                from headroom.proxy.cache_pressure_policy import (
+                    should_accept_cache_pressure_candidate,
+                    should_attempt_cache_pressure,
+                )
+
+                context_limit = self.anthropic_provider.get_context_limit(model)
+                baseline_body = {**body, "messages": optimized_messages}
+                baseline_tokens = await self._count_anthropic_request_tokens(
+                    baseline_body,
+                    headers,
+                )
+                if baseline_tokens is None:
+                    tags["cache_pressure_decision"] = "count_unavailable"
+                elif not should_attempt_cache_pressure(
+                    baseline_tokens,
+                    context_limit,
+                    self.config.cache_pressure_trigger_ratio,
+                ):
+                    tags["cache_pressure_decision"] = "below_threshold"
+                else:
+                    try:
+                        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+                        from headroom.transforms.compression_policy import resolve_policy
+
+                        pressure_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                        pressure_biases = (
+                            self.config.hooks.compute_biases(messages, _hook_ctx)
+                            if self.config.hooks and _hook_ctx is not None
+                            else None
+                        )
+                        pressure_result = await self._run_compression_in_executor(
+                            lambda: self.anthropic_pipeline.apply(
+                                messages=messages,
+                                model=model,
+                                model_limit=context_limit,
+                                context=extract_user_query(messages),
+                                frozen_message_count=0,
+                                idle_seconds=idle_seconds,
+                                biases=pressure_biases,
+                                request_id=request_id,
+                                compression_policy=pressure_policy,
+                                **proxy_pipeline_kwargs(self.config),
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
+                        pressure_messages = normalize_message_cache_control(
+                            pressure_result.messages
+                        )
+                        candidate_body = {**body, "messages": pressure_messages}
+                        candidate_tokens = await self._count_anthropic_request_tokens(
+                            candidate_body,
+                            headers,
+                        )
+                        if candidate_tokens is None:
+                            tags["cache_pressure_decision"] = "candidate_count_unavailable"
+                        elif should_accept_cache_pressure_candidate(
+                            baseline_tokens,
+                            candidate_tokens,
+                            self.config.cache_pressure_max_output_ratio,
+                        ):
+                            optimized_messages = pressure_messages
+                            original_tokens = baseline_tokens
+                            optimized_tokens = candidate_tokens
+                            transforms_applied = list(pressure_result.transforms_applied) + [
+                                "cache_pressure:prefix_break"
+                            ]
+                            pipeline_timing = pressure_result.timing
+                            if pressure_result.waste_signals:
+                                waste_signals_dict = pressure_result.waste_signals.to_dict()
+                            frozen_message_count = 0
+                            tags["cache_pressure_decision"] = "accepted"
+                            body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
+                            logger.info(
+                                "[%s] Cache pressure: accepted prefix rewrite "
+                                "(%s -> %s tokens, context_limit=%s)",
+                                request_id,
+                                baseline_tokens,
+                                candidate_tokens,
+                                context_limit,
+                            )
+                        else:
+                            tags["cache_pressure_decision"] = "insufficient_reduction"
+                            logger.info(
+                                "[%s] Cache pressure: rejected prefix rewrite "
+                                "(%s -> %s tokens, max_output_ratio=%.3f)",
+                                request_id,
+                                baseline_tokens,
+                                candidate_tokens,
+                                self.config.cache_pressure_max_output_ratio,
+                            )
+                    except Exception as exc:
+                        tags["cache_pressure_decision"] = "candidate_failed"
+                        logger.warning(
+                            "[%s] Cache-pressure candidate failed (%s); preserving cached prefix",
+                            request_id,
+                            type(exc).__name__,
+                        )
 
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.

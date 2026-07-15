@@ -121,6 +121,14 @@ class ProxyConfig:
     # "cache" (freeze prior turns for prefix-cache stability).
     mode: str = "token"
 
+    # Opt-in cache-pressure escalation. Cache mode remains the steady state;
+    # near the model limit, one token-mode candidate may replace the cached
+    # prefix when the configured reduction is large enough.
+    cache_pressure_token_mode_enabled: bool = False
+    cache_pressure_trigger_ratio: float = 0.90
+    cache_pressure_max_output_ratio: float = 0.50
+    cache_pressure_count_timeout_seconds: float = 5.0
+
     # Optimization
     optimize: bool = True
     image_optimize: bool = True
@@ -415,6 +423,12 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
+        if not 0 < self.cache_pressure_trigger_ratio <= 1:
+            raise ValueError("cache_pressure_trigger_ratio must be in (0, 1]")
+        if not 0 < self.cache_pressure_max_output_ratio <= 1:
+            raise ValueError("cache_pressure_max_output_ratio must be in (0, 1]")
+        if not self.cache_pressure_count_timeout_seconds > 0:
+            raise ValueError("cache_pressure_count_timeout_seconds must be > 0")
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

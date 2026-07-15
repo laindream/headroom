@@ -4408,6 +4408,16 @@ def _proxy_config_from_env() -> ProxyConfig:
         # Default mode is CACHE (Headroom's coding posture): delta-only compression
         # at ~0 prefix-cache busts. HEADROOM_MODE overrides.
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
+        cache_pressure_token_mode_enabled=_get_env_bool(
+            "HEADROOM_CACHE_PRESSURE_TOKEN_MODE", False
+        ),
+        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.90),
+        cache_pressure_max_output_ratio=_get_env_float(
+            "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", 0.50
+        ),
+        cache_pressure_count_timeout_seconds=_get_env_float(
+            "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
+        ),
         # Default savings profile is "coding" so proxy_pipeline_kwargs applies its
         # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
         # overrides.
@@ -5084,6 +5094,16 @@ if __name__ == "__main__":
         if protect_tool_results
         else frozenset(),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
+        cache_pressure_token_mode_enabled=_get_env_bool(
+            "HEADROOM_CACHE_PRESSURE_TOKEN_MODE", False
+        ),
+        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.90),
+        cache_pressure_max_output_ratio=_get_env_float(
+            "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", 0.50
+        ),
+        cache_pressure_count_timeout_seconds=_get_env_float(
+            "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
+        ),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",

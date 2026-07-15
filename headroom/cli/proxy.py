@@ -113,6 +113,11 @@ def _get_env_float_optional(name: str) -> float | None:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
+def _get_env_float(name: str, default: float) -> float:
+    value = _get_env_float_optional(name)
+    return default if value is None else value
+
+
 def _selected_context_tool() -> str:
     raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
     if not raw:
@@ -1089,6 +1094,16 @@ def proxy(
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
         mode=effective_mode,
+        cache_pressure_token_mode_enabled=_get_env_bool(
+            "HEADROOM_CACHE_PRESSURE_TOKEN_MODE", False
+        ),
+        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.90),
+        cache_pressure_max_output_ratio=_get_env_float(
+            "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", 0.50
+        ),
+        cache_pressure_count_timeout_seconds=_get_env_float(
+            "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
+        ),
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
