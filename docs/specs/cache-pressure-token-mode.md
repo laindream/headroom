@@ -1,0 +1,78 @@
+# Spec: Cache-pressure token-mode escalation
+
+## Objective
+
+Keep Anthropic proxy traffic in cache mode during normal operation. When a
+request approaches the model context limit, allow one deliberate prefix-cache
+rewrite only when a full-history token-mode candidate removes enough input.
+Use the configured Anthropic upstream token-count endpoint instead of
+Headroom's heuristic counter for both sides of that decision.
+
+## Tech stack
+
+- Python 3.10+
+- FastAPI proxy with `httpx.AsyncClient`
+- CLIProxyAPI-compatible `POST /v1/messages/count_tokens`
+- pytest / pytest-asyncio
+
+## Commands
+
+```bash
+pytest -q tests/test_cache_pressure_token_mode.py
+ruff check headroom tests
+ruff format --check headroom tests
+```
+
+## Project structure
+
+- `headroom/proxy/cache_pressure_policy.py`: pure threshold/acceptance policy
+- `headroom/proxy/handlers/anthropic.py`: upstream count call and request flow
+- `headroom/proxy/models.py`: opt-in configuration
+- `tests/test_cache_pressure_token_mode.py`: policy and count-boundary tests
+
+## Code style
+
+```python
+if original_tokens < int(context_limit * trigger_ratio):
+    return False
+return candidate_tokens <= int(original_tokens * max_output_ratio)
+```
+
+Prefer pure policy functions. Network failures remain request-local and never
+authorize a cache-breaking rewrite.
+
+## Testing strategy
+
+- Unit-test threshold boundary and 50% acceptance using pure functions.
+- Async-test full request body, auth headers, response parsing, timeout, and
+  malformed/error responses with `httpx.MockTransport` or a stub client.
+- Handler regression test proves an accepted escalation bypasses cached-prefix
+  overlay exactly once; rejected/failed counts preserve cache mode.
+- Run focused tests first, then existing Anthropic/cache-mode suites.
+
+## Boundaries
+
+- Always: count the complete Anthropic request (`system`, `tools`, `messages`).
+- Always: default feature off in upstream-compatible code; Armory opts in.
+- Always: keep configured cache mode after the pressure request completes.
+- Ask first: changing CLIProxyAPI or its auth/config.
+- Never: send credentials to a different host than configured Anthropic
+  upstream; log auth header values; use heuristic counts to authorize a prefix
+  rewrite.
+
+## Success criteria
+
+- Default cache behavior remains byte-for-byte compatible when feature is off.
+- At `original/context_limit < 0.90`, no token-mode candidate is generated.
+- At `>= 0.90`, candidate is accepted only when
+  `candidate/original <= 0.50`.
+- Count timeout/error/malformed response keeps cache-mode output.
+- Accepted candidate is forwarded without old-prefix overlay; next request can
+  freeze the newly forwarded prefix through existing tracker logic.
+- Armory pins the tested fork commit and enables the policy for the local
+  `gpt-5.6-sol` profile.
+
+## Open questions
+
+None. Ratios remain configurable; Armory defaults are trigger `0.90`, maximum
+output `0.50`.
