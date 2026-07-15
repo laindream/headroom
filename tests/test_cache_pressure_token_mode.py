@@ -205,16 +205,24 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
 
 
 @pytest.mark.parametrize(
-    ("candidate_tokens", "expected_first_content"),
+    (
+        "baseline_tokens",
+        "candidate_tokens",
+        "expected_first_content",
+        "expected_decision",
+    ),
     [
-        (175_000, "pressure-compressed history"),
-        (175_001, "cached forwarded request"),
-        (None, "cached forwarded request"),
+        (334_799, None, "cached forwarded request", "below_threshold"),
+        (350_000, 175_000, "pressure-compressed history", "accepted"),
+        (350_000, 175_001, "cached forwarded request", "insufficient_reduction"),
+        (350_000, None, "cached forwarded request", "candidate_count_unavailable"),
     ],
 )
 def test_cache_pressure_candidate_controls_prefix_overlay(
+    baseline_tokens: int,
     candidate_tokens: int | None,
     expected_first_content: str,
+    expected_decision: str,
 ) -> None:
     config = ProxyConfig(
         mode="cache",
@@ -234,6 +242,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     )
     app = create_app(config)
     captured: dict[str, object] = {}
+    captured_logs: list[object] = []
     tracker = _Tracker()
 
     with TestClient(app) as client:
@@ -243,7 +252,12 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
             get_or_create=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
-        proxy._count_anthropic_request_tokens = AsyncMock(side_effect=[350_000, candidate_tokens])
+        count_results = [baseline_tokens]
+        if expected_decision != "below_threshold":
+            count_results.append(candidate_tokens)
+        count_tokens = AsyncMock(side_effect=count_results)
+        proxy._count_anthropic_request_tokens = count_tokens
+        proxy.logger = SimpleNamespace(log=captured_logs.append)
 
         def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
             if kwargs["frozen_message_count"] == 0:
@@ -292,3 +306,18 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     sent_messages = captured["body"]["messages"]
     assert sent_messages[0]["content"] == expected_first_content
     assert tracker.previous_forwarded[0]["content"] == expected_first_content
+    assert count_tokens.await_count == (1 if expected_decision == "below_threshold" else 2)
+    assert len(captured_logs) == 1
+    tags = captured_logs[0].tags
+    assert tags["cache_pressure_decision"] == expected_decision
+    assert tags["cache_pressure_baseline_tokens"] == baseline_tokens
+    assert tags["cache_pressure_context_usage_ratio"] == round(baseline_tokens / 372_000, 6)
+    if candidate_tokens is None:
+        assert "cache_pressure_candidate_tokens" not in tags
+        assert "cache_pressure_candidate_ratio" not in tags
+    else:
+        assert tags["cache_pressure_candidate_tokens"] == candidate_tokens
+        assert tags["cache_pressure_candidate_ratio"] == round(
+            candidate_tokens / baseline_tokens,
+            6,
+        )

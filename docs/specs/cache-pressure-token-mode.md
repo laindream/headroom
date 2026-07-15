@@ -48,6 +48,9 @@ authorize a cache-breaking rewrite.
   malformed/error responses with `httpx.MockTransport` or a stub client.
 - Handler regression test proves an accepted escalation bypasses cached-prefix
   overlay exactly once; rejected/failed counts preserve cache mode.
+- Handler regression test proves every successful baseline count records exact
+  baseline/context utilization, and every successful candidate count records
+  exact candidate/baseline reduction without extra work.
 - Run focused tests first, then existing Anthropic/cache-mode suites.
 
 ## Boundaries
@@ -67,6 +70,10 @@ authorize a cache-breaking rewrite.
 - At `>= 0.90`, candidate is accepted only when
   `candidate/original <= 0.50`.
 - Count timeout/error/malformed response keeps cache-mode output.
+- `below_threshold` logs exact baseline tokens and context utilization without
+  generating a candidate. Accepted and insufficient-reduction decisions also
+  log exact candidate tokens and candidate/baseline ratio when that count
+  succeeds.
 - Accepted candidate is forwarded without old-prefix overlay; next request can
   freeze the newly forwarded prefix through existing tracker logic.
 - Armory pins the tested fork commit and enables the policy for the local

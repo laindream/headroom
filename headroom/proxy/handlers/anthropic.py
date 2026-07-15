@@ -1601,6 +1601,12 @@ class AnthropicHandlerMixin:
                     baseline_body,
                     headers,
                 )
+                if baseline_tokens is not None:
+                    tags["cache_pressure_baseline_tokens"] = baseline_tokens
+                    tags["cache_pressure_context_usage_ratio"] = round(
+                        baseline_tokens / context_limit,
+                        6,
+                    )
                 if baseline_tokens is None:
                     tags["cache_pressure_decision"] = "count_unavailable"
                 elif not should_attempt_cache_pressure(
@@ -1643,6 +1649,12 @@ class AnthropicHandlerMixin:
                             candidate_body,
                             headers,
                         )
+                        if candidate_tokens is not None:
+                            tags["cache_pressure_candidate_tokens"] = candidate_tokens
+                            tags["cache_pressure_candidate_ratio"] = round(
+                                candidate_tokens / baseline_tokens,
+                                6,
+                            )
                         if candidate_tokens is None:
                             tags["cache_pressure_decision"] = "candidate_count_unavailable"
                         elif should_accept_cache_pressure_candidate(
