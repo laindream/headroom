@@ -8,6 +8,7 @@ only ones that called `self.logger.log(...)`.
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -145,6 +146,53 @@ async def test_finalize_stream_response_logs_original_and_compressed_messages():
     assert len(entries) == 1
     assert entries[0]["request_messages"] == original
     assert entries[0]["compressed_messages"] == body["messages"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_finalizer_records_original_to_forwarded_prefix_mapping():
+    """Pressure-rewritten input and client history stay paired for the next cache turn."""
+
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    tracker = SimpleNamespace(update_from_response=MagicMock())
+    forwarded = [{"role": "user", "content": "pressure-compressed prefix"}]
+    original = [
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": "original historical answer"},
+        {"role": "user", "content": "pressure-triggering delta"},
+    ]
+    assistant = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "streamed answer"}],
+    }
+
+    await proxy._finalize_stream_response(
+        body={"messages": forwarded},
+        provider="anthropic",
+        model="gpt-5.6-sol",
+        request_id="req-pressure-stream",
+        original_tokens=350_000,
+        optimized_tokens=150_000,
+        tokens_saved=200_000,
+        transforms_applied=["cache_pressure:prefix_break"],
+        optimization_latency=10.0,
+        stream_state=_stream_state(output_tokens=5),
+        start_time=0.0,
+        prefix_tracker=tracker,
+        original_messages=original,
+        full_sse_data="event: message_stop\ndata: {}\n\n",
+        parsed_response={
+            "id": "msg_pressure_stream",
+            "type": "message",
+            **assistant,
+        },
+    )
+
+    tracker.update_from_response.assert_called_once_with(
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        messages=forwarded + [assistant],
+        original_messages=original + [assistant],
+    )
 
 
 @pytest.mark.asyncio

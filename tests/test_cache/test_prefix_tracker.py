@@ -350,6 +350,31 @@ class TestSessionTrackerStore:
         )
         assert session_id == "explicit-id-123"
 
+    def test_compute_session_id_from_claude_code_header(self, store):
+        """Claude Code's native session header should isolate concurrent sessions."""
+
+        class MockRequest:
+            headers = {"x-claude-code-session-id": "claude-session-123"}
+
+        session_id = store.compute_session_id(
+            MockRequest(), "claude-3", [{"role": "user", "content": "Hi"}]
+        )
+        assert session_id == "claude-session-123"
+
+    def test_headroom_session_header_overrides_claude_code_header(self, store):
+        """The documented Headroom override remains the highest priority."""
+
+        class MockRequest:
+            headers = {
+                "x-headroom-session-id": "headroom-session",
+                "x-claude-code-session-id": "claude-session",
+            }
+
+        session_id = store.compute_session_id(
+            MockRequest(), "claude-3", [{"role": "user", "content": "Hi"}]
+        )
+        assert session_id == "headroom-session"
+
     def test_compute_session_id_from_hash(self, store):
         """Should hash model + system prompt as fallback."""
 

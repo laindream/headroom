@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,6 +13,7 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
+from headroom.cache.prefix_tracker import _strip_cache_control
 from headroom.cli.main import main
 from headroom.proxy.cache_pressure_policy import (
     should_accept_cache_pressure_candidate,
@@ -18,6 +21,12 @@ from headroom.proxy.cache_pressure_policy import (
 )
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.transforms.content_router import (
+    CompressionStrategy,
+    ContentRouter,
+    ContentRouterConfig,
+    RouterCompressionResult,
+)
 
 
 def test_cache_pressure_threshold_uses_model_context_limit() -> None:
@@ -250,7 +259,6 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     captured_logs: list[object] = []
     pressure_pipeline_kwargs: dict[str, object] = {}
     tracker = _Tracker()
-
     with TestClient(app) as client:
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
@@ -337,3 +345,246 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         assert "cache_pressure_target_ratio" not in tags
     else:
         assert tags["cache_pressure_target_ratio"] == 0.12
+
+
+def test_accepted_pressure_prefix_is_reused_by_next_cache_turn(monkeypatch) -> None:
+    """A one-turn prefix rewrite becomes the next cache turn's immutable prefix."""
+
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "mcp__plugin_headroom_headroom__")
+    config = ProxyConfig(
+        mode="cache",
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        image_optimize=False,
+        ccr_inject_tool=True,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        cache_pressure_token_mode_enabled=True,
+        cache_pressure_trigger_ratio=0.80,
+        cache_pressure_target_ratio=0.10,
+        cache_pressure_max_output_ratio=0.50,
+        cache_pressure_count_timeout_seconds=0.25,
+    )
+    app = create_app(config)
+    tracker = _Tracker()
+    retrieve_tool = {
+        "name": "mcp__plugin_headroom_headroom__headroom_retrieve",
+        "description": "Retrieve compressed context",
+        "input_schema": {
+            "type": "object",
+            "properties": {"hash": {"type": "string"}},
+            "required": ["hash"],
+        },
+    }
+    sent_bodies: list[dict[str, object]] = []
+    pipeline_inputs: list[tuple[int, list[dict[str, object]]]] = []
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *_args, **_kwargs: "pressure-transition-session",
+            get_or_create=lambda *_args, **_kwargs: tracker,
+        )
+        proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
+        proxy._count_anthropic_request_tokens = AsyncMock(
+            side_effect=[350_000, 150_000, 180_000, 190_000]
+        )
+
+        def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
+            messages = [message.copy() for message in kwargs["messages"]]
+            frozen = kwargs["frozen_message_count"]
+            pipeline_inputs.append((frozen, messages))
+            if frozen == 0:
+                # Deliberately collapse the whole request to one message. The
+                # production router is currently 1:1, but the transition must
+                # remain correct if a future token transform merges messages.
+                return _result(
+                    [
+                        {
+                            "role": "user",
+                            "content": "pressure-compressed full request "
+                            "[Retrieve more: hash=abcdef123456abcdef123456]",
+                        }
+                    ],
+                    marker="cache_pressure:token_mode",
+                )
+            return _result(messages)
+
+        proxy.anthropic_pipeline.apply = apply_pipeline
+
+        async def fake_retry(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN202
+            sent_bodies.append(json.loads(json.dumps(body)))
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"msg_pressure_{len(sent_bodies)}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"answer {len(sent_bodies)}"}],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = fake_retry
+
+        first = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "tools": [retrieve_tool],
+                "messages": tracker.previous_original
+                + [{"role": "user", "content": "pressure-triggering live turn"}],
+            },
+        )
+        next_original = tracker.previous_original + [
+            {"role": "user", "content": "first post-pressure cache delta"}
+        ]
+        second = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "tools": [retrieve_tool],
+                "messages": next_original,
+            },
+        )
+        third_original = tracker.previous_original + [
+            {"role": "user", "content": "second post-pressure cache delta"}
+        ]
+        third = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "tools": [retrieve_tool],
+                "messages": third_original,
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert len(sent_bodies) == 3
+    first_forwarded = sent_bodies[0]["messages"]
+    second_forwarded = sent_bodies[1]["messages"]
+    third_forwarded = sent_bodies[2]["messages"]
+    assert len(first_forwarded) == 1
+    assert second_forwarded[0] == first_forwarded[0]
+    assert second_forwarded[1]["role"] == "assistant"
+    assert second_forwarded[1]["content"][0]["text"] == "answer 1"
+    assert second_forwarded[-1] == {
+        "role": "user",
+        "content": "first post-pressure cache delta",
+    }
+    assert _strip_cache_control(third_forwarded[: len(second_forwarded)]) == (
+        _strip_cache_control(second_forwarded)
+    )
+    assert third_forwarded[len(second_forwarded)]["role"] == "assistant"
+    assert third_forwarded[len(second_forwarded)]["content"][0]["text"] == "answer 2"
+    assert third_forwarded[-1] == {
+        "role": "user",
+        "content": "second post-pressure cache delta",
+    }
+    assert sent_bodies[0]["tools"] == [retrieve_tool]
+    assert sent_bodies[1]["tools"] == [retrieve_tool]
+    assert sent_bodies[2]["tools"] == [retrieve_tool]
+    for forwarded in (second_forwarded, third_forwarded):
+        assert (
+            sum(
+                1
+                for message in forwarded
+                for block in (
+                    message.get("content") if isinstance(message.get("content"), list) else []
+                )
+                if "cache_control" in block
+            )
+            == 1
+        )
+    assert len(tracker.previous_original) != len(tracker.previous_forwarded)
+    assert tracker.previous_forwarded[: len(third_forwarded)] == third_forwarded
+    assert proxy._count_anthropic_request_tokens.await_count == 4
+    assert [frozen for frozen, _messages in pipeline_inputs] == [2, 0, 2, 4]
+
+
+def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
+    monkeypatch,
+) -> None:
+    """A pressure request must not leak its aggressive runtime profile to cache traffic."""
+
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "2")
+
+    class WordTokenizer:
+        @staticmethod
+        def count_text(value: str) -> int:
+            return len(value.split())
+
+    router = ContentRouter(ContentRouterConfig(enable_kompress=False))
+    start_barrier = threading.Barrier(2)
+    compress_barrier = threading.Barrier(4)
+    observed: dict[str, list[tuple[float | None, bool]]] = {
+        "pressure": [],
+        "cache": [],
+    }
+
+    def fake_compress(content, **_kwargs):  # noqa: ANN001, ANN202
+        request_kind = "pressure" if content.startswith("pressure") else "cache"
+        compress_barrier.wait(timeout=3)
+        observed[request_kind].append(
+            (
+                router._runtime_target_ratio,
+                router._runtime_force_kompress,
+            )
+        )
+        return RouterCompressionResult(
+            compressed=content,
+            original=content,
+            strategy_used=CompressionStrategy.PASSTHROUGH,
+        )
+
+    router.compress = fake_compress
+
+    def apply(kind: str, *, target_ratio: float | None, force_kompress: bool) -> None:
+        start_barrier.wait(timeout=3)
+        router.apply(
+            messages=[
+                {"role": "user", "content": f"{kind}-{index} " + "word " * 80} for index in range(2)
+            ],
+            tokenizer=WordTokenizer(),
+            model_limit=372_000,
+            compress_user_messages=True,
+            target_ratio=target_ratio,
+            force_kompress=force_kompress,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pressure = executor.submit(
+            apply,
+            "pressure",
+            target_ratio=0.10,
+            force_kompress=True,
+        )
+        cache = executor.submit(
+            apply,
+            "cache",
+            target_ratio=None,
+            force_kompress=False,
+        )
+        pressure.result(timeout=3)
+        cache.result(timeout=3)
+
+    assert observed == {
+        "pressure": [(0.10, True), (0.10, True)],
+        "cache": [(None, False), (None, False)],
+    }

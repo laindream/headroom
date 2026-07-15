@@ -767,7 +767,7 @@ class PrefixCacheTracker:
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
-    Keyed by session ID (from x-headroom-session-id header or computed hash).
+    Keyed by session ID (from an explicit client header or computed hash).
     Automatically cleans up expired sessions.
     """
 
@@ -805,7 +805,8 @@ class SessionTrackerStore:
 
         Priority:
         1. x-headroom-session-id header (explicit)
-        2. Hash of (model + system prompt) — stable per conversation
+        2. x-claude-code-session-id header (Claude Code native)
+        3. Hash of (model + system prompt) — stable per conversation
 
         The system prompt is harvested from ``role:"system"`` entries in
         ``messages``. Anthropic carries the system prompt as a top-level
@@ -820,6 +821,9 @@ class SessionTrackerStore:
             session_header = request.headers.get("x-headroom-session-id")
             if session_header:
                 return str(session_header)
+            claude_session_header = request.headers.get("x-claude-code-session-id")
+            if claude_session_header:
+                return str(claude_session_header)
 
         # Fall back to hashing model + all system-text content.
         system_parts: list[str] = []

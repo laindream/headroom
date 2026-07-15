@@ -1179,6 +1179,20 @@ class ContentRouterConfig:
     search_group_by_file: bool = False
 
 
+@dataclass
+class _ContentRouterRequestState:
+    """Mutable values whose lifetime is one router request/thread."""
+
+    target_ratio: float | None = None
+    force_kompress: bool = False
+    kompress_model: str | None = None
+    compression_policy: Any = None
+    tool_call_args: dict[str, str] = field(default_factory=dict)
+    tool_call_commands: dict[str, str] = field(default_factory=dict)
+    protect_read_tool_ids: set[str] = field(default_factory=set)
+    protect_read_msg_indices: set[int] = field(default_factory=set)
+
+
 class ContentRouter(Transform):
     """Intelligent router that selects optimal compression strategy.
 
@@ -1264,6 +1278,14 @@ class ContentRouter(Transform):
             self.config.ccr_inject_marker = False
             self.config.smart_crusher_lossless_only = True
         self._observer = observer
+        # A ContentRouter instance is shared by every proxy request. Keep all
+        # request-derived knobs and tool maps thread-local so a pressure-mode
+        # request cannot alter a concurrent cache-mode request (or vice versa).
+        self._request_local = threading.local()
+        # Preserve the legacy post-apply inspection surface without feeding it
+        # back into active requests: properties fall back to the last completed
+        # request only when the current thread has no active request state.
+        self._last_request_state = _ContentRouterRequestState()
 
         # Lazy-loaded compressors
         self._code_compressor: Any = None
@@ -1279,10 +1301,6 @@ class ContentRouter(Transform):
         self._relevance_scorer: Any = None
         self._relevance_scorer_tried: bool = False
         self._relevance_prewarm_started: bool = False
-        # tool_call_id → compact args text, populated by _build_tool_name_map.
-        self._tool_call_args: dict[str, str] = {}
-        # tool_call_id → raw shell command (bash-search fold), same population.
-        self._tool_call_commands: dict[str, str] = {}
 
         # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
         # ONNX). Its inference scales O(tokens) and runs synchronously on the
@@ -1342,18 +1360,86 @@ class ContentRouter(Transform):
         # TOIN integration for cross-strategy learning
         self._toin: Any = None
 
-        # F2.2: per-request CompressionPolicy, set from
-        # ``kwargs["compression_policy"]`` at the start of ``apply()``
-        # and read by ``_record_to_toin`` to gate TOIN writes when
-        # ``policy.toin_read_only`` is true (Subscription mode).
-        # Defaults to ``None`` so direct ``compress()`` callers (e.g.
-        # tests, hand-written pipelines that don't go through the
-        # proxy) keep pre-F2.2 behaviour: TOIN writes are not gated.
-        # Same pattern the existing ``_runtime_target_ratio`` /
-        # ``_runtime_kompress_model`` fields below use.
-        self._runtime_compression_policy: Any = None
-
         self._cache = CompressionCache()
+
+    def _active_request_state(self) -> _ContentRouterRequestState:
+        state = getattr(self._request_local, "state", None)
+        return state if state is not None else self._last_request_state
+
+    def _worker_request_state(self) -> _ContentRouterRequestState:
+        """Copy the runtime-only state needed by a nested compression worker."""
+
+        state = self._active_request_state()
+        return _ContentRouterRequestState(
+            target_ratio=state.target_ratio,
+            force_kompress=state.force_kompress,
+            kompress_model=state.kompress_model,
+            compression_policy=state.compression_policy,
+        )
+
+    @property
+    def _runtime_target_ratio(self) -> float | None:
+        return self._active_request_state().target_ratio
+
+    @_runtime_target_ratio.setter
+    def _runtime_target_ratio(self, value: float | None) -> None:
+        self._active_request_state().target_ratio = value
+
+    @property
+    def _runtime_force_kompress(self) -> bool:
+        return self._active_request_state().force_kompress
+
+    @_runtime_force_kompress.setter
+    def _runtime_force_kompress(self, value: bool) -> None:
+        self._active_request_state().force_kompress = value
+
+    @property
+    def _runtime_kompress_model(self) -> str | None:
+        return self._active_request_state().kompress_model
+
+    @_runtime_kompress_model.setter
+    def _runtime_kompress_model(self, value: str | None) -> None:
+        self._active_request_state().kompress_model = value
+
+    @property
+    def _runtime_compression_policy(self) -> Any:
+        return self._active_request_state().compression_policy
+
+    @_runtime_compression_policy.setter
+    def _runtime_compression_policy(self, value: Any) -> None:
+        self._active_request_state().compression_policy = value
+
+    @property
+    def _tool_call_args(self) -> dict[str, str]:
+        return self._active_request_state().tool_call_args
+
+    @_tool_call_args.setter
+    def _tool_call_args(self, value: dict[str, str]) -> None:
+        self._active_request_state().tool_call_args = value
+
+    @property
+    def _tool_call_commands(self) -> dict[str, str]:
+        return self._active_request_state().tool_call_commands
+
+    @_tool_call_commands.setter
+    def _tool_call_commands(self, value: dict[str, str]) -> None:
+        self._active_request_state().tool_call_commands = value
+
+    @property
+    def _protect_read_tool_ids(self) -> set[str]:
+        return self._active_request_state().protect_read_tool_ids
+
+    @_protect_read_tool_ids.setter
+    def _protect_read_tool_ids(self, value: set[str]) -> None:
+        self._active_request_state().protect_read_tool_ids = value
+
+    @property
+    def _protect_read_msg_indices(self) -> set[int]:
+        return self._active_request_state().protect_read_msg_indices
+
+    @_protect_read_msg_indices.setter
+    def _protect_read_msg_indices(self, value: set[int]) -> None:
+        self._active_request_state().protect_read_msg_indices = value
 
     def _record_to_toin(
         self,
@@ -1444,12 +1530,24 @@ class ContentRouter(Transform):
             logger.debug("TOIN recording failed (non-fatal): %s", e)
 
     def _timed_compress(
-        self, content: str, context: str, bias: float
+        self,
+        content: str,
+        context: str,
+        bias: float,
+        request_state: _ContentRouterRequestState,
     ) -> tuple[RouterCompressionResult, float]:
         """Compress with wall-clock timing.  Used by parallel executor."""
-        t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
-        return result, (time.perf_counter() - t0) * 1000
+        previous_state = getattr(self._request_local, "state", None)
+        self._request_local.state = request_state
+        try:
+            t0 = time.perf_counter()
+            result = self.compress(content, context=context, bias=bias)
+            return result, (time.perf_counter() - t0) * 1000
+        finally:
+            if previous_state is None:
+                del self._request_local.state
+            else:
+                self._request_local.state = previous_state
 
     def compress(
         self,
@@ -3164,6 +3262,32 @@ class ContentRouter(Transform):
         tokenizer: Tokenizer,
         **kwargs: Any,
     ) -> TransformResult:
+        """Apply routing with request-derived state isolated from concurrent calls."""
+
+        previous_state = getattr(self._request_local, "state", None)
+        self._request_local.state = _ContentRouterRequestState(
+            target_ratio=kwargs.get("target_ratio"),
+            force_kompress=bool(kwargs.get("force_kompress", self.config.force_kompress_all)),
+            kompress_model=kwargs.get("kompress_model"),
+            compression_policy=kwargs.get("compression_policy"),
+        )
+        try:
+            return self._apply_request(messages, tokenizer, **kwargs)
+        finally:
+            if previous_state is None:
+                # Compatibility only: old callers inspect these fields after
+                # apply(). Active requests never read this shared snapshot.
+                self._last_request_state = self._request_local.state
+                del self._request_local.state
+            else:
+                self._request_local.state = previous_state
+
+    def _apply_request(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        **kwargs: Any,
+    ) -> TransformResult:
         """Apply intelligent routing to messages.
 
         Args:
@@ -3225,19 +3349,6 @@ class ContentRouter(Transform):
             "min_chars_for_block_compression",
             self.config.min_chars_for_block_compression,
         )
-        # Store runtime options on self for access by _route_and_compress_block
-        self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
-        self._runtime_force_kompress: bool = bool(
-            kwargs.get("force_kompress", self.config.force_kompress_all)
-        )
-        self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
-        # F2.2: capture the per-request CompressionPolicy so
-        # ``_record_to_toin`` can gate TOIN writes on
-        # ``policy.toin_read_only``. ``None`` when the caller didn't
-        # pass a policy — ``_record_to_toin`` treats that as "no gate"
-        # to preserve pre-F2.2 behaviour for non-proxy callers.
-        self._runtime_compression_policy = kwargs.get("compression_policy")
-
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
@@ -3740,7 +3851,13 @@ class ContentRouter(Transform):
                     futures = []
                     for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                         futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                            executor.submit(
+                                self._timed_compress,
+                                task_content,
+                                task_ctx,
+                                task_bias,
+                                self._worker_request_state(),
+                            )
                         )
                     task_results = [f.result() for f in futures]
 
