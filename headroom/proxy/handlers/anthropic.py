@@ -1621,6 +1621,14 @@ class AnthropicHandlerMixin:
                         from headroom.transforms.compression_policy import resolve_policy
 
                         pressure_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                        pressure_pipeline_kwargs = proxy_pipeline_kwargs(self.config)
+                        pressure_pipeline_kwargs.update(
+                            target_ratio=self.config.cache_pressure_target_ratio,
+                            force_kompress=True,
+                        )
+                        tags["cache_pressure_target_ratio"] = (
+                            self.config.cache_pressure_target_ratio
+                        )
                         pressure_biases = (
                             self.config.hooks.compute_biases(messages, _hook_ctx)
                             if self.config.hooks and _hook_ctx is not None
@@ -1637,7 +1645,7 @@ class AnthropicHandlerMixin:
                                 biases=pressure_biases,
                                 request_id=request_id,
                                 compression_policy=pressure_policy,
-                                **proxy_pipeline_kwargs(self.config),
+                                **pressure_pipeline_kwargs,
                             ),
                             timeout=COMPRESSION_TIMEOUT_SECONDS,
                         )

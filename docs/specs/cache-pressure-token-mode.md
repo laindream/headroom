@@ -5,6 +5,8 @@
 Keep Anthropic proxy traffic in cache mode during normal operation. When a
 request approaches the model context limit, allow one deliberate prefix-cache
 rewrite only when a full-history token-mode candidate removes enough input.
+Generate that candidate with an explicit per-content target ratio and forced
+Kompress while retaining the active profile's safety protections.
 Use the configured Anthropic upstream token-count endpoint instead of
 Headroom's heuristic counter for both sides of that decision.
 
@@ -58,6 +60,8 @@ authorize a cache-breaking rewrite.
 - Always: count the complete Anthropic request (`system`, `tools`, `messages`).
 - Always: default feature off in upstream-compatible code; Armory opts in.
 - Always: keep configured cache mode after the pressure request completes.
+- Always: treat the pressure target ratio as candidate-generation guidance;
+  authorize rewrites only from exact whole-request counts.
 - Ask first: changing CLIProxyAPI or its auth/config.
 - Never: send credentials to a different host than configured Anthropic
   upstream; log auth header values; use heuristic counts to authorize a prefix
@@ -66,8 +70,9 @@ authorize a cache-breaking rewrite.
 ## Success criteria
 
 - Default cache behavior remains byte-for-byte compatible when feature is off.
-- At `original/context_limit < 0.90`, no token-mode candidate is generated.
-- At `>= 0.90`, candidate is accepted only when
+- Below the configured trigger ratio, no token-mode candidate is generated.
+- At or above it, the candidate receives the configured pressure target ratio,
+  forces Kompress, and is accepted only when
   `candidate/original <= 0.50`.
 - Count timeout/error/malformed response keeps cache-mode output.
 - `below_threshold` logs exact baseline tokens and context utilization without
@@ -76,10 +81,11 @@ authorize a cache-breaking rewrite.
   succeeds.
 - Accepted candidate is forwarded without old-prefix overlay; next request can
   freeze the newly forwarded prefix through existing tracker logic.
-- Armory pins the tested fork commit and enables the policy for the local
-  `gpt-5.6-sol` profile.
+- Armory pins the tested fork commit and enables trigger `0.80`, pressure target
+  `0.10`, and maximum whole-request output `0.50` for the local `gpt-5.6-sol`
+  profile.
 
 ## Open questions
 
-None. Ratios remain configurable; Armory defaults are trigger `0.90`, maximum
-output `0.50`.
+None. Ratios remain configurable; Armory defaults are trigger `0.80`, pressure
+target `0.10`, maximum whole-request output `0.50`.

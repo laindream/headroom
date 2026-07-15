@@ -127,6 +127,7 @@ def test_direct_server_env_reads_cache_pressure_policy(monkeypatch) -> None:
 
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TOKEN_MODE", "1")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", "0.91")
+    monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TARGET_RATIO", "0.12")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", "0.49")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", "4.5")
 
@@ -134,6 +135,7 @@ def test_direct_server_env_reads_cache_pressure_policy(monkeypatch) -> None:
 
     assert config.cache_pressure_token_mode_enabled is True
     assert config.cache_pressure_trigger_ratio == 0.91
+    assert config.cache_pressure_target_ratio == 0.12
     assert config.cache_pressure_max_output_ratio == 0.49
     assert config.cache_pressure_count_timeout_seconds == 4.5
 
@@ -152,6 +154,7 @@ def test_click_proxy_env_reads_cache_pressure_policy() -> None:
             env={
                 "HEADROOM_CACHE_PRESSURE_TOKEN_MODE": "1",
                 "HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO": "0.91",
+                "HEADROOM_CACHE_PRESSURE_TARGET_RATIO": "0.12",
                 "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO": "0.49",
                 "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS": "4.5",
             },
@@ -162,6 +165,7 @@ def test_click_proxy_env_reads_cache_pressure_policy() -> None:
     config = captured["config"]
     assert config.cache_pressure_token_mode_enabled is True
     assert config.cache_pressure_trigger_ratio == 0.91
+    assert config.cache_pressure_target_ratio == 0.12
     assert config.cache_pressure_max_output_ratio == 0.49
     assert config.cache_pressure_count_timeout_seconds == 4.5
 
@@ -237,12 +241,14 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         ccr_context_tracking=False,
         cache_pressure_token_mode_enabled=True,
         cache_pressure_trigger_ratio=0.90,
+        cache_pressure_target_ratio=0.12,
         cache_pressure_max_output_ratio=0.50,
         cache_pressure_count_timeout_seconds=0.25,
     )
     app = create_app(config)
     captured: dict[str, object] = {}
     captured_logs: list[object] = []
+    pressure_pipeline_kwargs: dict[str, object] = {}
     tracker = _Tracker()
 
     with TestClient(app) as client:
@@ -261,6 +267,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
 
         def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
             if kwargs["frozen_message_count"] == 0:
+                pressure_pipeline_kwargs.update(kwargs)
                 pressure_messages = [message.copy() for message in kwargs["messages"]]
                 pressure_messages[0]["content"] = "pressure-compressed history"
                 return _result(
@@ -307,6 +314,11 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     assert sent_messages[0]["content"] == expected_first_content
     assert tracker.previous_forwarded[0]["content"] == expected_first_content
     assert count_tokens.await_count == (1 if expected_decision == "below_threshold" else 2)
+    if expected_decision == "below_threshold":
+        assert pressure_pipeline_kwargs == {}
+    else:
+        assert pressure_pipeline_kwargs["target_ratio"] == 0.12
+        assert pressure_pipeline_kwargs["force_kompress"] is True
     assert len(captured_logs) == 1
     tags = captured_logs[0].tags
     assert tags["cache_pressure_decision"] == expected_decision
@@ -321,3 +333,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
             candidate_tokens / baseline_tokens,
             6,
         )
+    if expected_decision == "below_threshold":
+        assert "cache_pressure_target_ratio" not in tags
+    else:
+        assert tags["cache_pressure_target_ratio"] == 0.12
