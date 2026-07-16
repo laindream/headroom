@@ -2675,8 +2675,9 @@ def inject_tool_search_deferral(
     """Return a new ``tools`` list with non-core tools deferred + a search tool
     injected, or the original list unchanged when injection doesn't apply.
 
-    No-op when: not a list, fewer than ``_TOOL_SEARCH_MIN_TOOLS``, a tool_search
-    tool is already present (client already defers), or nothing would be deferred.
+    No-op when: not a list, fewer than ``_TOOL_SEARCH_MIN_TOOLS``, a server-side
+    tool_search tool or Claude Code's client-side ``ToolSearch`` is already present,
+    or nothing would be deferred.
 
     Invariants enforced (else Anthropic 400s): the search tool is never deferred;
     at least one tool stays non-deferred; a deferred tool never carries
@@ -2687,8 +2688,11 @@ def inject_tool_search_deferral(
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
     for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        if not isinstance(tool, dict):
+            continue
+        if (
+            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            or tool.get("name") == "ToolSearch"
         ):
             return tools  # client already uses tool search — leave it alone
 

@@ -215,6 +215,18 @@ def test_noop_when_client_already_uses_tool_search() -> None:
     assert inject_tool_search_deferral(tools) is tools
 
 
+def test_noop_when_claude_code_already_uses_client_tool_search() -> None:
+    tools = _tools(20) + [
+        {"name": "ToolSearch", "input_schema": {"type": "object"}},
+        {
+            "name": "DeferredToolPlaceholder",
+            "input_schema": {"type": "object"},
+            "defer_loading": True,
+        },
+    ]
+    assert inject_tool_search_deferral(tools) is tools
+
+
 def test_noop_when_nothing_to_defer() -> None:
     # every tool is core -> nothing deferred -> cache prefix untouched
     core = [
