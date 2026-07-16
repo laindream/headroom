@@ -192,6 +192,7 @@ async def test_streaming_finalizer_records_original_to_forwarded_prefix_mapping(
         cache_write_tokens=0,
         messages=forwarded + [assistant],
         original_messages=original + [assistant],
+        response_total_tokens=1_005,
     )
 
 

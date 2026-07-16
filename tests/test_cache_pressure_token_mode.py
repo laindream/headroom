@@ -1,4 +1,4 @@
-"""Cache-pressure escalation uses upstream counts and breaks cache only for a large win."""
+"""Claude-compatible pressure trigger; count-API candidates need a large win."""
 
 from __future__ import annotations
 
@@ -13,9 +13,12 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from headroom.cache.prefix_tracker import _strip_cache_control
+from headroom.cache.prefix_tracker import PrefixCacheTracker, _strip_cache_control
 from headroom.cli.main import main
 from headroom.proxy.cache_pressure_policy import (
+    anthropic_usage_total_tokens,
+    claude_auto_compact_threshold,
+    estimate_claude_context_tokens,
     should_accept_cache_pressure_candidate,
     should_attempt_cache_pressure,
 )
@@ -29,9 +32,157 @@ from headroom.transforms.content_router import (
 )
 
 
-def test_cache_pressure_threshold_uses_model_context_limit() -> None:
-    assert not should_attempt_cache_pressure(334_799, 372_000, 0.90)
-    assert should_attempt_cache_pressure(334_800, 372_000, 0.90)
+def test_cache_pressure_threshold_matches_claude_effective_window() -> None:
+    assert claude_auto_compact_threshold(372_000, 0.85) == 299_200
+    assert not should_attempt_cache_pressure(299_199, 372_000, 0.85)
+    assert should_attempt_cache_pressure(299_200, 372_000, 0.85)
+
+
+def test_cache_pressure_default_trigger_ratio_is_85_percent() -> None:
+    assert ProxyConfig().cache_pressure_trigger_ratio == 0.85
+
+
+def test_claude_context_estimator_matches_custom_model_content_rules() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "abcdef"},
+                {"type": "image", "source": {"type": "base64", "data": "ignored"}},
+                {"type": "document", "source": {"type": "base64", "data": "ignored"}},
+                {
+                    "type": "tool_use",
+                    "name": "lookup",
+                    "input": {"emoji": "😀"},
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [{"type": "text", "text": "123456789"}],
+                },
+            ],
+        }
+    ]
+
+    # gpt-5.6-sol is unknown to Claude Code, so text uses 3 UTF-16 code
+    # units/token. Image/document blocks are fixed at 2,000 each.
+    assert estimate_claude_context_tokens(messages, model="gpt-5.6-sol") == 4_012
+
+
+def test_claude_context_estimator_uses_exact_known_model_set() -> None:
+    message = [{"role": "user", "content": "x" * 8}]
+
+    assert estimate_claude_context_tokens(message, model="claude-opus-4-6[1m]") == 2
+    assert estimate_claude_context_tokens(message, model="claude-future-custom") == 3
+
+
+def test_claude_context_estimator_uses_latest_api_usage_plus_appended_tail() -> None:
+    previous = [
+        {"role": "user", "content": "old question"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "old answer", "cache_control": {"type": "ephemeral"}}
+            ],
+        },
+    ]
+    current = [
+        previous[0],
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "old answer"}],
+        },
+        {"role": "user", "content": "x" * 30},
+    ]
+
+    assert (
+        estimate_claude_context_tokens(
+            current,
+            model="gpt-5.6-sol",
+            previous_messages=previous,
+            latest_response_total_tokens=290_000,
+        )
+        == 290_010
+    )
+
+
+def test_anthropic_usage_total_matches_claude_anchor_formula() -> None:
+    assert (
+        anthropic_usage_total_tokens(
+            {
+                "input_tokens": 887,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 329_216,
+                "output_tokens": 84,
+            }
+        )
+        == 330_187
+    )
+    assert anthropic_usage_total_tokens({"input_tokens": 887}) is None
+
+
+def test_prefix_tracker_preserves_latest_response_total_tokens() -> None:
+    tracker = PrefixCacheTracker("anthropic")
+    tracker.update_from_response(
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        messages=[{"role": "assistant", "content": "answer"}],
+        response_total_tokens=330_187,
+    )
+
+    assert tracker.get_last_response_total_tokens() == 330_187
+
+
+def test_streaming_message_delta_preserves_cli_proxy_usage_fields() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    with TestClient(app) as client:
+        usage = client.app.state.proxy._parse_sse_usage(
+            b"event: message_delta\n"
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+            b'"usage":{"input_tokens":887,"cache_creation_input_tokens":0,'
+            b'"cache_read_input_tokens":329216,"output_tokens":84}}\n\n',
+            "anthropic",
+        )
+
+    assert usage == {
+        "input_tokens": 887,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 329_216,
+        "output_tokens": 84,
+    }
+
+
+def test_streaming_message_delta_does_not_erase_message_start_ttl_usage() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    with TestClient(app) as client:
+        usage = client.app.state.proxy._parse_sse_usage(
+            b"event: message_start\n"
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":887,'
+            b'"cache_creation_input_tokens":1200,"cache_read_input_tokens":329216,'
+            b'"cache_creation":{"ephemeral_5m_input_tokens":200,'
+            b'"ephemeral_1h_input_tokens":1000}}}}\n\n'
+            b"event: message_delta\n"
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+            b'"usage":{"output_tokens":84}}\n\n',
+            "anthropic",
+        )
+
+    assert usage["cache_creation_ephemeral_5m_input_tokens"] == 200
+    assert usage["cache_creation_ephemeral_1h_input_tokens"] == 1_000
 
 
 def test_cache_pressure_candidate_requires_configured_reduction() -> None:
@@ -183,6 +334,7 @@ class _Tracker:
     def __init__(self) -> None:
         self._cached_token_count = 300_000
         self._idle_seconds_at_fetch = 0.0
+        self._last_response_total_tokens = 300_000
         self.previous_original = [
             {"role": "user", "content": "original historical request"},
             {"role": "assistant", "content": "historical answer"},
@@ -201,9 +353,13 @@ class _Tracker:
     def get_last_forwarded_messages(self):  # noqa: ANN201
         return self.previous_forwarded.copy()
 
+    def get_last_response_total_tokens(self) -> int:
+        return self._last_response_total_tokens
+
     def update_from_response(self, **kwargs) -> None:  # noqa: ANN003
         self.previous_original = kwargs["original_messages"].copy()
         self.previous_forwarded = kwargs["messages"].copy()
+        self._last_response_total_tokens = kwargs.get("response_total_tokens")
 
 
 def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
@@ -219,20 +375,23 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
 
 @pytest.mark.parametrize(
     (
+        "pressure_tokens",
         "baseline_tokens",
         "candidate_tokens",
         "expected_first_content",
         "expected_decision",
     ),
     [
-        (334_799, None, "cached forwarded request", "below_threshold"),
-        (350_000, 175_000, "pressure-compressed history", "accepted"),
-        (350_000, 175_001, "cached forwarded request", "insufficient_reduction"),
-        (350_000, None, "cached forwarded request", "candidate_count_unavailable"),
+        (299_199, None, None, "cached forwarded request", "below_threshold"),
+        (299_200, None, None, "cached forwarded request", "count_unavailable"),
+        (299_200, 350_000, 227_500, "pressure-compressed history", "accepted"),
+        (299_200, 350_000, 227_501, "cached forwarded request", "insufficient_reduction"),
+        (299_200, 350_000, None, "cached forwarded request", "candidate_count_unavailable"),
     ],
 )
 def test_cache_pressure_candidate_controls_prefix_overlay(
-    baseline_tokens: int,
+    pressure_tokens: int,
+    baseline_tokens: int | None,
     candidate_tokens: int | None,
     expected_first_content: str,
     expected_decision: str,
@@ -249,9 +408,9 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         ccr_handle_responses=False,
         ccr_context_tracking=False,
         cache_pressure_token_mode_enabled=True,
-        cache_pressure_trigger_ratio=0.90,
+        cache_pressure_trigger_ratio=0.85,
         cache_pressure_target_ratio=0.12,
-        cache_pressure_max_output_ratio=0.50,
+        cache_pressure_max_output_ratio=0.65,
         cache_pressure_count_timeout_seconds=0.25,
     )
     app = create_app(config)
@@ -259,6 +418,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     captured_logs: list[object] = []
     pressure_pipeline_kwargs: dict[str, object] = {}
     tracker = _Tracker()
+    tracker._last_response_total_tokens = pressure_tokens - 4
     with TestClient(app) as client:
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
@@ -266,9 +426,9 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
             get_or_create=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
-        count_results = [baseline_tokens]
-        if expected_decision != "below_threshold":
-            count_results.append(candidate_tokens)
+        count_results = (
+            [] if expected_decision == "below_threshold" else [baseline_tokens, candidate_tokens]
+        )
         count_tokens = AsyncMock(side_effect=count_results)
         proxy._count_anthropic_request_tokens = count_tokens
         proxy.logger = SimpleNamespace(log=captured_logs.append)
@@ -321,8 +481,11 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     sent_messages = captured["body"]["messages"]
     assert sent_messages[0]["content"] == expected_first_content
     assert tracker.previous_forwarded[0]["content"] == expected_first_content
-    assert count_tokens.await_count == (1 if expected_decision == "below_threshold" else 2)
-    if expected_decision == "below_threshold":
+    expected_count_calls = (
+        0 if expected_decision == "below_threshold" else 1 if baseline_tokens is None else 2
+    )
+    assert count_tokens.await_count == expected_count_calls
+    if expected_decision in {"below_threshold", "count_unavailable"}:
         assert pressure_pipeline_kwargs == {}
     else:
         assert pressure_pipeline_kwargs["target_ratio"] == 0.12
@@ -330,8 +493,14 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     assert len(captured_logs) == 1
     tags = captured_logs[0].tags
     assert tags["cache_pressure_decision"] == expected_decision
-    assert tags["cache_pressure_baseline_tokens"] == baseline_tokens
-    assert tags["cache_pressure_context_usage_ratio"] == round(baseline_tokens / 372_000, 6)
+    assert tags["cache_pressure_trigger_tokens"] == pressure_tokens
+    assert tags["cache_pressure_effective_context_limit"] == 352_000
+    assert tags["cache_pressure_trigger_threshold_tokens"] == 299_200
+    assert tags["cache_pressure_context_usage_ratio"] == round(pressure_tokens / 352_000, 6)
+    if baseline_tokens is None:
+        assert "cache_pressure_baseline_tokens" not in tags
+    else:
+        assert tags["cache_pressure_baseline_tokens"] == baseline_tokens
     if candidate_tokens is None:
         assert "cache_pressure_candidate_tokens" not in tags
         assert "cache_pressure_candidate_ratio" not in tags
@@ -341,7 +510,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
             candidate_tokens / baseline_tokens,
             6,
         )
-    if expected_decision == "below_threshold":
+    if expected_decision in {"below_threshold", "count_unavailable"}:
         assert "cache_pressure_target_ratio" not in tags
     else:
         assert tags["cache_pressure_target_ratio"] == 0.12
@@ -363,9 +532,9 @@ def test_accepted_pressure_prefix_is_reused_by_next_cache_turn(monkeypatch) -> N
         ccr_handle_responses=False,
         ccr_context_tracking=False,
         cache_pressure_token_mode_enabled=True,
-        cache_pressure_trigger_ratio=0.80,
+        cache_pressure_trigger_ratio=0.85,
         cache_pressure_target_ratio=0.10,
-        cache_pressure_max_output_ratio=0.50,
+        cache_pressure_max_output_ratio=0.65,
         cache_pressure_count_timeout_seconds=0.25,
     )
     app = create_app(config)
@@ -389,9 +558,7 @@ def test_accepted_pressure_prefix_is_reused_by_next_cache_turn(monkeypatch) -> N
             get_or_create=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
-        proxy._count_anthropic_request_tokens = AsyncMock(
-            side_effect=[350_000, 150_000, 180_000, 190_000]
-        )
+        proxy._count_anthropic_request_tokens = AsyncMock(side_effect=[350_000, 150_000])
 
         def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
             messages = [message.copy() for message in kwargs["messages"]]
@@ -514,7 +681,7 @@ def test_accepted_pressure_prefix_is_reused_by_next_cache_turn(monkeypatch) -> N
         )
     assert len(tracker.previous_original) != len(tracker.previous_forwarded)
     assert tracker.previous_forwarded[: len(third_forwarded)] == third_forwarded
-    assert proxy._count_anthropic_request_tokens.await_count == 4
+    assert proxy._count_anthropic_request_tokens.await_count == 2
     assert [frozen for frozen, _messages in pipeline_inputs] == [2, 0, 2, 4]
 
 

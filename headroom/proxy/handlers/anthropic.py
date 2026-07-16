@@ -27,6 +27,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.cache_pressure_policy import anthropic_usage_total_tokens
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -1575,12 +1576,13 @@ class AnthropicHandlerMixin:
                 optimized_messages = _norm
 
             # Cache-pressure escalation: cache mode remains the steady state,
-            # but once the exact request that would be forwarded approaches the
-            # model limit, evaluate one full-history token-mode candidate. Run
-            # this AFTER cached-prefix overlay so the baseline is the request the
-            # provider would actually see. An accepted candidate deliberately
-            # supersedes that overlay for one request; update_from_response later
-            # records the new forwarded prefix for subsequent cache-mode turns.
+            # but once Claude Code's context estimate approaches its compact
+            # line, evaluate one full-history token-mode candidate. Run this
+            # AFTER cached-prefix overlay so the count-API baseline is the
+            # request the provider would actually see. An accepted candidate
+            # deliberately supersedes that overlay for one request;
+            # update_from_response later records the new forwarded prefix for
+            # subsequent cache-mode turns.
             if (
                 self.config.cache_pressure_token_mode_enabled
                 and is_cache_mode(self.config.mode)
@@ -1591,32 +1593,58 @@ class AnthropicHandlerMixin:
                 and getattr(self, "anthropic_backend", None) is None
             ):
                 from headroom.proxy.cache_pressure_policy import (
+                    claude_auto_compact_threshold,
+                    claude_effective_context_limit,
+                    estimate_claude_context_tokens,
                     should_accept_cache_pressure_candidate,
                     should_attempt_cache_pressure,
                 )
 
                 context_limit = self.anthropic_provider.get_context_limit(model)
-                baseline_body = {**body, "messages": optimized_messages}
-                baseline_tokens = await self._count_anthropic_request_tokens(
-                    baseline_body,
-                    headers,
+                latest_response_total_tokens = (
+                    prefix_tracker.get_last_response_total_tokens()
+                    if hasattr(prefix_tracker, "get_last_response_total_tokens")
+                    else None
                 )
-                if baseline_tokens is not None:
-                    tags["cache_pressure_baseline_tokens"] = baseline_tokens
-                    tags["cache_pressure_context_usage_ratio"] = round(
-                        baseline_tokens / context_limit,
-                        6,
-                    )
-                if baseline_tokens is None:
-                    tags["cache_pressure_decision"] = "count_unavailable"
-                elif not should_attempt_cache_pressure(
-                    baseline_tokens,
+                pressure_tokens = estimate_claude_context_tokens(
+                    original_client_messages,
+                    model=model,
+                    previous_messages=prefix_tracker.get_last_original_messages(),
+                    latest_response_total_tokens=latest_response_total_tokens,
+                )
+                effective_context_limit = claude_effective_context_limit(context_limit)
+                trigger_threshold_tokens = claude_auto_compact_threshold(
+                    context_limit,
+                    self.config.cache_pressure_trigger_ratio,
+                )
+                tags["cache_pressure_trigger_tokens"] = pressure_tokens
+                tags["cache_pressure_effective_context_limit"] = effective_context_limit
+                tags["cache_pressure_trigger_threshold_tokens"] = trigger_threshold_tokens
+                tags["cache_pressure_context_usage_ratio"] = round(
+                    pressure_tokens / effective_context_limit
+                    if effective_context_limit > 0
+                    else 0.0,
+                    6,
+                )
+                if not should_attempt_cache_pressure(
+                    pressure_tokens,
                     context_limit,
                     self.config.cache_pressure_trigger_ratio,
                 ):
                     tags["cache_pressure_decision"] = "below_threshold"
                 else:
+                    baseline_body = {**body, "messages": optimized_messages}
+                    baseline_tokens = await self._count_anthropic_request_tokens(
+                        baseline_body,
+                        headers,
+                    )
+                    if baseline_tokens is None:
+                        tags["cache_pressure_decision"] = "count_unavailable"
+                    else:
+                        tags["cache_pressure_baseline_tokens"] = baseline_tokens
                     try:
+                        if baseline_tokens is None:
+                            raise RuntimeError("cache-pressure baseline count unavailable")
                         from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
                         from headroom.transforms.compression_policy import resolve_policy
 
@@ -1684,11 +1712,12 @@ class AnthropicHandlerMixin:
                             body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
                             logger.info(
                                 "[%s] Cache pressure: accepted prefix rewrite "
-                                "(%s -> %s tokens, context_limit=%s)",
+                                "(%s -> %s tokens, pressure=%s/%s)",
                                 request_id,
                                 baseline_tokens,
                                 candidate_tokens,
-                                context_limit,
+                                pressure_tokens,
+                                trigger_threshold_tokens,
                             )
                         else:
                             tags["cache_pressure_decision"] = "insufficient_reduction"
@@ -1701,12 +1730,14 @@ class AnthropicHandlerMixin:
                                 self.config.cache_pressure_max_output_ratio,
                             )
                     except Exception as exc:
-                        tags["cache_pressure_decision"] = "candidate_failed"
-                        logger.warning(
-                            "[%s] Cache-pressure candidate failed (%s); preserving cached prefix",
-                            request_id,
-                            type(exc).__name__,
-                        )
+                        if baseline_tokens is not None:
+                            tags["cache_pressure_decision"] = "candidate_failed"
+                            logger.warning(
+                                "[%s] Cache-pressure candidate failed (%s); "
+                                "preserving cached prefix",
+                                request_id,
+                                type(exc).__name__,
+                            )
 
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.
@@ -3165,6 +3196,7 @@ class AnthropicHandlerMixin:
                     cw_5m_tokens = 0
                     cw_1h_tokens = 0
                     uncached_input_tokens = 0
+                    usage: dict[str, Any] = {}
                     if resp_json:
                         usage = resp_json.get("usage", {})
                         output_tokens = usage.get("output_tokens", 0)
@@ -3230,6 +3262,7 @@ class AnthropicHandlerMixin:
                         cache_write_tokens=cw_tokens,
                         messages=next_forwarded_messages,
                         original_messages=next_original_messages,
+                        response_total_tokens=anthropic_usage_total_tokens(usage),
                     )
 
                     # Cache response

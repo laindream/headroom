@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.cache_pressure_policy import anthropic_usage_total_tokens
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
@@ -205,7 +206,27 @@ class StreamingMixin:
                     elif event_type == "message_delta":
                         delta_usage = data.get("usage", {})
                         if delta_usage:
-                            usage["output_tokens"] = delta_usage.get("output_tokens", 0)
+                            for key in (
+                                "input_tokens",
+                                "output_tokens",
+                                "cache_read_input_tokens",
+                                "cache_creation_input_tokens",
+                            ):
+                                if key in delta_usage:
+                                    usage[key] = delta_usage[key]
+                            if any(
+                                key in delta_usage
+                                for key in (
+                                    "cache_creation",
+                                    "cache_creation_ephemeral_5m_input_tokens",
+                                    "cache_creation_ephemeral_1h_input_tokens",
+                                )
+                            ):
+                                cache_write_5m, cache_write_1h = (
+                                    self._extract_anthropic_cache_ttl_metrics(delta_usage)
+                                )
+                                usage["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
+                                usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
 
                 elif provider == "openai":
                     # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
@@ -854,7 +875,8 @@ class StreamingMixin:
                 if current is None or current == 0:
                     stream_state[key] = late_usage[key]
 
-        output_tokens = stream_state["output_tokens"]
+        reported_output_tokens = stream_state["output_tokens"]
+        output_tokens = reported_output_tokens
         if output_tokens is None:
             output_tokens = stream_state["total_bytes"] // 40
             logger.warning(
@@ -929,6 +951,18 @@ class StreamingMixin:
                 cache_write_tokens=cache_write_tokens,
                 messages=next_forwarded,
                 original_messages=next_original,
+                response_total_tokens=(
+                    anthropic_usage_total_tokens(
+                        {
+                            "input_tokens": provider_input_tokens,
+                            "cache_creation_input_tokens": cache_write_tokens,
+                            "cache_read_input_tokens": cache_read_tokens,
+                            "output_tokens": reported_output_tokens,
+                        }
+                    )
+                    if provider == "anthropic"
+                    else None
+                ),
             )
 
         # Active-compression denominator (``attempted_input_tokens``) is

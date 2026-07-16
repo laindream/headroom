@@ -125,7 +125,7 @@ class ProxyConfig:
     # near the model limit, one token-mode candidate may replace the cached
     # prefix when the configured reduction is large enough.
     cache_pressure_token_mode_enabled: bool = False
-    cache_pressure_trigger_ratio: float = 0.90
+    cache_pressure_trigger_ratio: float = 0.85
     # Per-content keep ratio for the aggressive pressure candidate. The
     # whole-request rewrite is still gated by cache_pressure_max_output_ratio.
     cache_pressure_target_ratio: float = 0.10

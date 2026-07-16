@@ -429,6 +429,7 @@ class PrefixCacheTracker:
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        self._last_response_total_tokens: int | None = None
         # Idle gap (seconds) since the PREVIOUS turn's response, captured by
         # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
         # _last_activity. Without this snapshot, seconds_since_activity() reads
@@ -467,6 +468,7 @@ class PrefixCacheTracker:
         messages: list[dict[str, Any]],
         message_token_counts: list[int] | None = None,
         original_messages: list[dict[str, Any]] | None = None,
+        response_total_tokens: int | None = None,
     ) -> None:
         """Update tracker with cache metrics from the API response.
 
@@ -484,6 +486,13 @@ class PrefixCacheTracker:
         self._turn_number += 1
         self._last_original_messages = copy.deepcopy(original_messages or messages)
         self._last_forwarded_messages = copy.deepcopy(messages)
+        self._last_response_total_tokens = (
+            response_total_tokens
+            if isinstance(response_total_tokens, int)
+            and not isinstance(response_total_tokens, bool)
+            and response_total_tokens > 0
+            else None
+        )
 
         # Compute total cached tokens (read + write = what's in cache now)
         total_cached = cache_read_tokens + cache_write_tokens
@@ -528,6 +537,9 @@ class PrefixCacheTracker:
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
+
+    def get_last_response_total_tokens(self) -> int | None:
+        return self._last_response_total_tokens
 
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""

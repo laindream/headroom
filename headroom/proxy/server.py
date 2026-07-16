@@ -4411,7 +4411,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         cache_pressure_token_mode_enabled=_get_env_bool(
             "HEADROOM_CACHE_PRESSURE_TOKEN_MODE", False
         ),
-        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.90),
+        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.85),
         cache_pressure_target_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TARGET_RATIO", 0.10),
         cache_pressure_max_output_ratio=_get_env_float(
             "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", 0.50
@@ -5098,7 +5098,7 @@ if __name__ == "__main__":
         cache_pressure_token_mode_enabled=_get_env_bool(
             "HEADROOM_CACHE_PRESSURE_TOKEN_MODE", False
         ),
-        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.90),
+        cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.85),
         cache_pressure_target_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TARGET_RATIO", 0.10),
         cache_pressure_max_output_ratio=_get_env_float(
             "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", 0.50
