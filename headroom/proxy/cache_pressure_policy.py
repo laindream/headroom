@@ -200,3 +200,14 @@ def should_accept_cache_pressure_candidate(
     if original_tokens <= 0 or candidate_tokens < 0 or not 0 < max_output_ratio <= 1:
         return False
     return candidate_tokens <= original_tokens * max_output_ratio
+
+
+def should_rescue_cache_pressure_candidate(
+    original_tokens: int,
+    candidate_tokens: int,
+    safe_input_limit: int,
+) -> bool:
+    """Accept a non-economic rewrite only when it prevents a hard overflow."""
+    if original_tokens <= 0 or candidate_tokens < 0 or safe_input_limit <= 0:
+        return False
+    return original_tokens > safe_input_limit >= candidate_tokens

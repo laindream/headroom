@@ -817,7 +817,7 @@ class SessionTrackerStore:
 
         Priority:
         1. x-headroom-session-id header (explicit)
-        2. x-claude-code-session-id header (Claude Code native)
+        2. x-claude-code-session-id header, scoped by agent id when present
         3. Hash of (model + system prompt) — stable per conversation
 
         The system prompt is harvested from ``role:"system"`` entries in
@@ -835,6 +835,9 @@ class SessionTrackerStore:
                 return str(session_header)
             claude_session_header = request.headers.get("x-claude-code-session-id")
             if claude_session_header:
+                claude_agent_header = request.headers.get("x-claude-code-agent-id")
+                if claude_agent_header:
+                    return f"{claude_session_header}:agent:{claude_agent_header}"
                 return str(claude_session_header)
 
         # Fall back to hashing model + all system-text content.

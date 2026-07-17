@@ -1598,6 +1598,7 @@ class AnthropicHandlerMixin:
                     estimate_claude_context_tokens,
                     should_accept_cache_pressure_candidate,
                     should_attempt_cache_pressure,
+                    should_rescue_cache_pressure_candidate,
                 )
 
                 context_limit = self.anthropic_provider.get_context_limit(model)
@@ -1691,13 +1692,22 @@ class AnthropicHandlerMixin:
                                 candidate_tokens / baseline_tokens,
                                 6,
                             )
+                            candidate_meets_reduction = should_accept_cache_pressure_candidate(
+                                baseline_tokens,
+                                candidate_tokens,
+                                self.config.cache_pressure_max_output_ratio,
+                            )
+                            hard_limit_rescue = (
+                                not candidate_meets_reduction
+                                and should_rescue_cache_pressure_candidate(
+                                    baseline_tokens,
+                                    candidate_tokens,
+                                    effective_context_limit,
+                                )
+                            )
                         if candidate_tokens is None:
                             tags["cache_pressure_decision"] = "candidate_count_unavailable"
-                        elif should_accept_cache_pressure_candidate(
-                            baseline_tokens,
-                            candidate_tokens,
-                            self.config.cache_pressure_max_output_ratio,
-                        ):
+                        elif candidate_meets_reduction or hard_limit_rescue:
                             optimized_messages = pressure_messages
                             original_tokens = baseline_tokens
                             optimized_tokens = candidate_tokens
@@ -1709,15 +1719,20 @@ class AnthropicHandlerMixin:
                                 waste_signals_dict = pressure_result.waste_signals.to_dict()
                             frozen_message_count = 0
                             tags["cache_pressure_decision"] = "accepted"
+                            if hard_limit_rescue:
+                                tags["cache_pressure_acceptance_reason"] = "hard_limit_rescue"
                             body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
                             logger.info(
                                 "[%s] Cache pressure: accepted prefix rewrite "
-                                "(%s -> %s tokens, pressure=%s/%s)",
+                                "(%s -> %s tokens, pressure=%s/%s, reason=%s)",
                                 request_id,
                                 baseline_tokens,
                                 candidate_tokens,
                                 pressure_tokens,
                                 trigger_threshold_tokens,
+                                "hard_limit_rescue"
+                                if hard_limit_rescue
+                                else "configured_reduction",
                             )
                         else:
                             tags["cache_pressure_decision"] = "insufficient_reduction"

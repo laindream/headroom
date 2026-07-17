@@ -21,6 +21,7 @@ from headroom.proxy.cache_pressure_policy import (
     estimate_claude_context_tokens,
     should_accept_cache_pressure_candidate,
     should_attempt_cache_pressure,
+    should_rescue_cache_pressure_candidate,
 )
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
@@ -190,6 +191,13 @@ def test_cache_pressure_candidate_requires_configured_reduction() -> None:
     assert not should_accept_cache_pressure_candidate(350_000, 175_001, 0.50)
     assert not should_accept_cache_pressure_candidate(0, 0, 0.50)
     assert not should_accept_cache_pressure_candidate(350_000, -1, 0.50)
+
+
+def test_cache_pressure_candidate_rescues_only_a_hard_overflow() -> None:
+    assert should_rescue_cache_pressure_candidate(404_166, 331_602, 352_000)
+    assert not should_rescue_cache_pressure_candidate(352_000, 331_602, 352_000)
+    assert not should_rescue_cache_pressure_candidate(404_166, 352_001, 352_000)
+    assert not should_rescue_cache_pressure_candidate(404_166, -1, 352_000)
 
 
 class _CountProxy(AnthropicHandlerMixin):
@@ -386,6 +394,7 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
         (299_200, None, None, "cached forwarded request", "count_unavailable"),
         (299_200, 350_000, 227_500, "pressure-compressed history", "accepted"),
         (299_200, 350_000, 227_501, "cached forwarded request", "insufficient_reduction"),
+        (299_200, 404_166, 331_602, "pressure-compressed history", "accepted"),
         (299_200, 350_000, None, "cached forwarded request", "candidate_count_unavailable"),
     ],
 )

@@ -361,6 +361,23 @@ class TestSessionTrackerStore:
         )
         assert session_id == "claude-session-123"
 
+    def test_compute_session_id_isolates_agents_within_claude_session(self, store):
+        """Agent Teams sidechains must not share mutable prefix state."""
+
+        class MockRequest:
+            def __init__(self, agent_id):
+                self.headers = {
+                    "x-claude-code-session-id": "claude-session-123",
+                    "x-claude-code-agent-id": agent_id,
+                }
+
+        messages = [{"role": "user", "content": "Hi"}]
+        agent_a = store.compute_session_id(MockRequest("agent-a"), "claude-3", messages)
+        agent_b = store.compute_session_id(MockRequest("agent-b"), "claude-3", messages)
+
+        assert agent_a != agent_b
+        assert agent_a == store.compute_session_id(MockRequest("agent-a"), "claude-3", messages)
+
     def test_headroom_session_header_overrides_claude_code_header(self, store):
         """The documented Headroom override remains the highest priority."""
 
