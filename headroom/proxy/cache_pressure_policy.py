@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from typing import Any
 
 from headroom.cache.prefix_tracker import _canonicalize_for_prefix_compare
@@ -28,6 +29,18 @@ CLAUDE_FOUR_CHARS_PER_TOKEN_MODELS = frozenset(
         "claude-haiku-4-5",
     }
 )
+
+
+@dataclass
+class UpstreamContextRescue:
+    """One forced full-history candidate authorized by an upstream overflow."""
+
+    body: dict[str, Any]
+    optimized_tokens: int
+    transforms_applied: list[str]
+    pipeline_timing: dict[str, float]
+    waste_signals: dict[str, int] | None
+    additional_latency_ms: float = 0.0
 
 
 def _claude_chars_per_token(model: str) -> int:
@@ -202,12 +215,34 @@ def should_accept_cache_pressure_candidate(
     return candidate_tokens <= original_tokens * max_output_ratio
 
 
-def should_rescue_cache_pressure_candidate(
-    original_tokens: int,
-    candidate_tokens: int,
-    safe_input_limit: int,
-) -> bool:
-    """Accept a non-economic rewrite only when it prevents a hard overflow."""
-    if original_tokens <= 0 or candidate_tokens < 0 or safe_input_limit <= 0:
+def is_upstream_context_overflow(status_code: int, error_body: Any) -> bool:
+    """Recognize an explicit upstream context-window rejection.
+
+    Token estimates are intentionally excluded: a rescue retry is authorized
+    only by the provider's actual 400 response.
+    """
+    if status_code != 400:
         return False
-    return original_tokens > safe_input_limit >= candidate_tokens
+
+    if isinstance(error_body, bytes):
+        text = error_body.decode("utf-8", errors="replace")
+    elif isinstance(error_body, str):
+        text = error_body
+    else:
+        try:
+            text = json.dumps(error_body, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(error_body)
+
+    normalized = text.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "input exceeds the context window",
+            "context window exceeded",
+            "prompt is too long",
+            "maximum context length",
+            "exceed context limit",
+            "context_length_exceeded",
+        )
+    )

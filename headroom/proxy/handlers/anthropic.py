@@ -27,7 +27,11 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
-from headroom.proxy.cache_pressure_policy import anthropic_usage_total_tokens
+from headroom.proxy.cache_pressure_policy import (
+    UpstreamContextRescue,
+    anthropic_usage_total_tokens,
+    is_upstream_context_overflow,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -1085,6 +1089,9 @@ class AnthropicHandlerMixin:
             waste_signals_dict: dict[str, int] | None = None
             optimized_messages = messages
             optimized_tokens = original_tokens
+            precomputed_rescue_baseline: list[dict[str, Any]] | None = None
+            precomputed_rescue_messages: list[dict[str, Any]] | None = None
+            precomputed_rescue_result: Any | None = None
 
             # Get prefix cache tracker for this session. Anthropic carries the
             # system prompt as a top-level field, not a role:"system" message, so
@@ -1598,7 +1605,6 @@ class AnthropicHandlerMixin:
                     estimate_claude_context_tokens,
                     should_accept_cache_pressure_candidate,
                     should_attempt_cache_pressure,
-                    should_rescue_cache_pressure_candidate,
                 )
 
                 context_limit = self.anthropic_provider.get_context_limit(model)
@@ -1681,6 +1687,9 @@ class AnthropicHandlerMixin:
                         pressure_messages = normalize_message_cache_control(
                             pressure_result.messages
                         )
+                        precomputed_rescue_baseline = copy.deepcopy(optimized_messages)
+                        precomputed_rescue_messages = copy.deepcopy(pressure_messages)
+                        precomputed_rescue_result = pressure_result
                         candidate_body = {**body, "messages": pressure_messages}
                         candidate_tokens = await self._count_anthropic_request_tokens(
                             candidate_body,
@@ -1697,17 +1706,9 @@ class AnthropicHandlerMixin:
                                 candidate_tokens,
                                 self.config.cache_pressure_max_output_ratio,
                             )
-                            hard_limit_rescue = (
-                                not candidate_meets_reduction
-                                and should_rescue_cache_pressure_candidate(
-                                    baseline_tokens,
-                                    candidate_tokens,
-                                    effective_context_limit,
-                                )
-                            )
                         if candidate_tokens is None:
                             tags["cache_pressure_decision"] = "candidate_count_unavailable"
-                        elif candidate_meets_reduction or hard_limit_rescue:
+                        elif candidate_meets_reduction:
                             optimized_messages = pressure_messages
                             original_tokens = baseline_tokens
                             optimized_tokens = candidate_tokens
@@ -1719,20 +1720,15 @@ class AnthropicHandlerMixin:
                                 waste_signals_dict = pressure_result.waste_signals.to_dict()
                             frozen_message_count = 0
                             tags["cache_pressure_decision"] = "accepted"
-                            if hard_limit_rescue:
-                                tags["cache_pressure_acceptance_reason"] = "hard_limit_rescue"
                             body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
                             logger.info(
                                 "[%s] Cache pressure: accepted prefix rewrite "
-                                "(%s -> %s tokens, pressure=%s/%s, reason=%s)",
+                                "(%s -> %s tokens, pressure=%s/%s)",
                                 request_id,
                                 baseline_tokens,
                                 candidate_tokens,
                                 pressure_tokens,
                                 trigger_threshold_tokens,
-                                "hard_limit_rescue"
-                                if hard_limit_rescue
-                                else "configured_reduction",
                             )
                         else:
                             tags["cache_pressure_decision"] = "insufficient_reduction"
@@ -2743,6 +2739,111 @@ class AnthropicHandlerMixin:
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
 
+            context_overflow_rescue_started = False
+
+            async def _build_upstream_context_rescue() -> UpstreamContextRescue | None:
+                """Build one forced candidate after the provider proves overflow."""
+                nonlocal context_overflow_rescue_started
+                if context_overflow_rescue_started:
+                    return None
+                context_overflow_rescue_started = True
+
+                if (
+                    not self.config.cache_pressure_token_mode_enabled
+                    or not is_cache_mode(self.config.mode)
+                    or _bypass
+                    or upstream_base_url is not None
+                ):
+                    return None
+
+                current_messages = copy.deepcopy(body.get("messages") or [])
+                if not current_messages:
+                    return None
+
+                rescue_result = None
+                rescue_messages = None
+                additional_latency_ms = 0.0
+                if (
+                    precomputed_rescue_result is not None
+                    and precomputed_rescue_baseline == current_messages
+                    and precomputed_rescue_messages is not None
+                ):
+                    rescue_result = precomputed_rescue_result
+                    rescue_messages = copy.deepcopy(precomputed_rescue_messages)
+                else:
+                    rescue_started_at = time.perf_counter()
+                    try:
+                        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+                        from headroom.transforms.compression_policy import resolve_policy
+
+                        rescue_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                        rescue_pipeline_kwargs = proxy_pipeline_kwargs(self.config)
+                        rescue_pipeline_kwargs.update(
+                            target_ratio=self.config.cache_pressure_target_ratio,
+                            force_kompress=True,
+                        )
+                        rescue_biases = (
+                            self.config.hooks.compute_biases(current_messages, _hook_ctx)
+                            if self.config.hooks and _hook_ctx is not None
+                            else None
+                        )
+                        rescue_result = await self._run_compression_in_executor(
+                            lambda: self.anthropic_pipeline.apply(
+                                messages=current_messages,
+                                model=model,
+                                model_limit=self.anthropic_provider.get_context_limit(model),
+                                context=extract_user_query(current_messages),
+                                frozen_message_count=0,
+                                idle_seconds=idle_seconds,
+                                biases=rescue_biases,
+                                request_id=request_id,
+                                compression_policy=rescue_policy,
+                                **rescue_pipeline_kwargs,
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
+                        from headroom.cache.prefix_tracker import (
+                            normalize_message_cache_control,
+                        )
+
+                        rescue_messages = normalize_message_cache_control(
+                            rescue_result.messages
+                        )
+                    except Exception as exc:
+                        tags["cache_pressure_rescue_outcome"] = "candidate_failed"
+                        logger.warning(
+                            "[%s] Context-overflow rescue candidate failed (%s)",
+                            request_id,
+                            type(exc).__name__,
+                        )
+                        return None
+                    finally:
+                        additional_latency_ms = (
+                            time.perf_counter() - rescue_started_at
+                        ) * 1000.0
+
+                if rescue_result is None or rescue_messages is None:
+                    return None
+
+                _strip_streaming_only_content_fields(rescue_messages)
+                rescue_body = {**body, "messages": rescue_messages}
+                rescue_waste_signals = None
+                if rescue_result.waste_signals:
+                    rescue_waste_signals = (
+                        rescue_result.waste_signals.to_dict()
+                        if hasattr(rescue_result.waste_signals, "to_dict")
+                        else dict(rescue_result.waste_signals)
+                    )
+                return UpstreamContextRescue(
+                    body=rescue_body,
+                    optimized_tokens=tokenizer.count_messages(rescue_messages),
+                    transforms_applied=list(rescue_result.transforms_applied)
+                    + ["cache_pressure:prefix_break", "cache_pressure:upstream_context_rescue"],
+                    pipeline_timing=dict(rescue_result.timing or {}),
+                    waste_signals=rescue_waste_signals,
+                    additional_latency_ms=additional_latency_ms,
+                )
+
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
                 ccr_response_handler_enabled = bool(
@@ -2816,6 +2917,7 @@ class AnthropicHandlerMixin:
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
                         session_key=session_key,
+                        context_overflow_rescue_builder=_build_upstream_context_rescue,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
@@ -2832,6 +2934,61 @@ class AnthropicHandlerMixin:
                             path_for_log="/v1/messages",
                             timeout=self._anthropic_buffered_request_timeout(),
                         )
+                    if is_upstream_context_overflow(
+                        response.status_code,
+                        response.content,
+                    ):
+                        rescue = await _build_upstream_context_rescue()
+                        if rescue is not None:
+                            logger.warning(
+                                "[%s] Upstream rejected the context; retrying once "
+                                "with a forced full-history candidate",
+                                request_id,
+                            )
+                            response = await self._retry_request(
+                                "POST",
+                                url,
+                                headers,
+                                rescue.body,
+                                original_body_bytes=None,
+                                body_mutated=True,
+                                mutation_reasons=[
+                                    *body_mutation_tracker.reasons,
+                                    "upstream_context_rescue",
+                                ],
+                                request_id=request_id,
+                                forwarder_name="anthropic_context_overflow_rescue",
+                                path_for_log="/v1/messages",
+                                timeout=self._anthropic_buffered_request_timeout(),
+                            )
+                            if response.status_code == 200:
+                                body = rescue.body
+                                optimized_messages = body["messages"]
+                                optimized_tokens = rescue.optimized_tokens
+                                tokens_saved = max(0, original_tokens - optimized_tokens)
+                                transforms_applied = list(
+                                    dict.fromkeys(
+                                        [*transforms_applied, *rescue.transforms_applied]
+                                    )
+                                )
+                                pipeline_timing = {
+                                    **pipeline_timing,
+                                    **rescue.pipeline_timing,
+                                }
+                                if rescue.waste_signals is not None:
+                                    waste_signals_dict = rescue.waste_signals
+                                optimization_latency += rescue.additional_latency_ms
+                                frozen_message_count = 0
+                                tags["cache_pressure_decision"] = "accepted"
+                                tags["cache_pressure_acceptance_reason"] = (
+                                    "upstream_context_rescue"
+                                )
+                                tags["cache_pressure_rescue_outcome"] = "succeeded"
+                                body_mutation_tracker.mark_mutated(
+                                    "upstream_context_rescue"
+                                )
+                            else:
+                                tags["cache_pressure_rescue_outcome"] = "retry_failed"
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",

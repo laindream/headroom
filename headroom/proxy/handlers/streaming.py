@@ -10,10 +10,15 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.cache_pressure_policy import anthropic_usage_total_tokens
+from headroom.proxy.cache_pressure_policy import (
+    UpstreamContextRescue,
+    anthropic_usage_total_tokens,
+    is_upstream_context_overflow,
+)
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
@@ -1025,6 +1030,9 @@ class StreamingMixin:
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
+        context_overflow_rescue_builder: (
+            Callable[[], Awaitable[UpstreamContextRescue | None]] | None
+        ) = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1070,6 +1078,7 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                context_overflow_rescue_builder=context_overflow_rescue_builder,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1100,6 +1109,9 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        context_overflow_rescue_builder: (
+            Callable[[], Awaitable[UpstreamContextRescue | None]] | None
+        ),
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1280,6 +1292,106 @@ class StreamingMixin:
 
             self._cleanup_mid_turn_stream(session_key)
             return StreamingResponse(_error_gen(), media_type="text/event-stream")
+
+        if (
+            upstream_response.status_code >= 400
+            and context_overflow_rescue_builder is not None
+        ):
+            try:
+                initial_error_content = await upstream_response.aread()
+            except Exception:
+                initial_error_content = b""
+
+            if is_upstream_context_overflow(
+                upstream_response.status_code,
+                initial_error_content,
+            ):
+                try:
+                    rescue = await context_overflow_rescue_builder()
+                except Exception as exc:
+                    rescue = None
+                    tags["cache_pressure_rescue_outcome"] = "candidate_failed"
+                    logger.warning(
+                        "[%s] Streaming context-overflow rescue candidate failed (%s)",
+                        request_id,
+                        type(exc).__name__,
+                    )
+
+                if rescue is not None:
+                    initial_status = upstream_response.status_code
+                    initial_headers = dict(upstream_response.headers)
+                    await upstream_response.aclose()
+                    rescue_bytes, rescue_source = prepare_outbound_body_bytes(
+                        body=rescue.body,
+                        original_body_bytes=None,
+                        body_mutated=True,
+                    )
+                    log_outbound_request(
+                        forwarder="anthropic_stream_context_overflow_rescue",
+                        method="POST",
+                        path=url,
+                        body_bytes_count=len(rescue_bytes),
+                        body_mutated=True,
+                        mutation_reasons=[
+                            *(mutation_reasons or []),
+                            "upstream_context_rescue",
+                        ],
+                        request_id=request_id,
+                        source=rescue_source,
+                    )
+                    logger.warning(
+                        "[%s] Upstream rejected the streaming context; retrying once "
+                        "with a forced full-history candidate",
+                        request_id,
+                    )
+                    try:
+                        rescue_request = self.http_client.build_request(
+                            "POST",
+                            url,
+                            content=rescue_bytes,
+                            headers=outbound_headers,
+                        )
+                        rescue_response = await self.http_client.send(
+                            rescue_request,
+                            stream=True,
+                        )
+                    except httpx.TransportError as exc:
+                        logger.warning(
+                            "[%s] Streaming context-overflow retry failed to connect: %s",
+                            request_id,
+                            exc,
+                        )
+                        tags["cache_pressure_rescue_outcome"] = "retry_failed"
+                        upstream_response = httpx.Response(
+                            initial_status,
+                            headers=initial_headers,
+                            content=initial_error_content,
+                        )
+                    else:
+                        upstream_response = rescue_response
+                        if upstream_response.status_code == 200:
+                            body = rescue.body
+                            optimized_tokens = rescue.optimized_tokens
+                            tokens_saved = max(0, original_tokens - optimized_tokens)
+                            transforms_applied = list(
+                                dict.fromkeys(
+                                    [*transforms_applied, *rescue.transforms_applied]
+                                )
+                            )
+                            pipeline_timing = {
+                                **(pipeline_timing or {}),
+                                **rescue.pipeline_timing,
+                            }
+                            if rescue.waste_signals is not None:
+                                waste_signals = rescue.waste_signals
+                            optimization_latency += rescue.additional_latency_ms
+                            tags["cache_pressure_decision"] = "accepted"
+                            tags["cache_pressure_acceptance_reason"] = (
+                                "upstream_context_rescue"
+                            )
+                            tags["cache_pressure_rescue_outcome"] = "succeeded"
+                        else:
+                            tags["cache_pressure_rescue_outcome"] = "retry_failed"
 
         # Capture Codex rate-limit window data from the upstream response
         # headers, for *every* status. Codex (gpt-5.x) almost always streams, so

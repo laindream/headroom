@@ -16,12 +16,13 @@ from fastapi.testclient import TestClient
 from headroom.cache.prefix_tracker import PrefixCacheTracker, _strip_cache_control
 from headroom.cli.main import main
 from headroom.proxy.cache_pressure_policy import (
+    UpstreamContextRescue,
     anthropic_usage_total_tokens,
     claude_auto_compact_threshold,
     estimate_claude_context_tokens,
+    is_upstream_context_overflow,
     should_accept_cache_pressure_candidate,
     should_attempt_cache_pressure,
-    should_rescue_cache_pressure_candidate,
 )
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
@@ -193,11 +194,22 @@ def test_cache_pressure_candidate_requires_configured_reduction() -> None:
     assert not should_accept_cache_pressure_candidate(350_000, -1, 0.50)
 
 
-def test_cache_pressure_candidate_rescues_only_a_hard_overflow() -> None:
-    assert should_rescue_cache_pressure_candidate(404_166, 331_602, 352_000)
-    assert not should_rescue_cache_pressure_candidate(352_000, 331_602, 352_000)
-    assert not should_rescue_cache_pressure_candidate(404_166, 352_001, 352_000)
-    assert not should_rescue_cache_pressure_candidate(404_166, -1, 352_000)
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Your input exceeds the context window of this model. Please adjust your input and try again.",
+        "Prompt is too long for this model",
+        "This model's maximum context length is 372000 tokens",
+        "Input length and max_tokens exceed context limit",
+    ],
+)
+def test_upstream_context_overflow_requires_an_explicit_400(message: str) -> None:
+    assert is_upstream_context_overflow(400, message)
+    assert not is_upstream_context_overflow(500, message)
+
+
+def test_upstream_context_overflow_rejects_unrelated_400() -> None:
+    assert not is_upstream_context_overflow(400, "Invalid tool schema")
 
 
 class _CountProxy(AnthropicHandlerMixin):
@@ -394,7 +406,7 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
         (299_200, None, None, "cached forwarded request", "count_unavailable"),
         (299_200, 350_000, 227_500, "pressure-compressed history", "accepted"),
         (299_200, 350_000, 227_501, "cached forwarded request", "insufficient_reduction"),
-        (299_200, 404_166, 331_602, "pressure-compressed history", "accepted"),
+        (299_200, 404_166, 331_602, "cached forwarded request", "insufficient_reduction"),
         (299_200, 350_000, None, "cached forwarded request", "candidate_count_unavailable"),
     ],
 )
@@ -523,6 +535,306 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         assert "cache_pressure_target_ratio" not in tags
     else:
         assert tags["cache_pressure_target_ratio"] == 0.12
+
+
+_CONTEXT_OVERFLOW_MESSAGE = (
+    "Your input exceeds the context window of this model. "
+    "Please adjust your input and try again."
+)
+
+
+def _upstream_error(message: str) -> httpx.Response:
+    return httpx.Response(
+        400,
+        json={"type": "error", "error": {"type": "invalid_request_error", "message": message}},
+    )
+
+
+def _upstream_success() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "id": "msg_rescued",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+        },
+    )
+
+
+def _run_context_overflow_rescue_case(
+    first_error_message: str,
+    retry_response: httpx.Response,
+    *,
+    pressure_tokens: int = 100_000,
+    count_results: list[int | None] | None = None,
+) -> SimpleNamespace:
+    config = ProxyConfig(
+        mode="cache",
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        image_optimize=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        cache_pressure_token_mode_enabled=True,
+        cache_pressure_trigger_ratio=0.85,
+        cache_pressure_target_ratio=0.12,
+        cache_pressure_max_output_ratio=0.80,
+        cache_pressure_count_timeout_seconds=0.25,
+    )
+    app = create_app(config)
+    tracker = _Tracker()
+    tracker._last_response_total_tokens = pressure_tokens - 4
+    sent_bodies: list[dict[str, object]] = []
+    captured_logs: list[object] = []
+    pipeline_frozen_counts: list[int] = []
+    responses = [_upstream_error(first_error_message), retry_response]
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *_args, **_kwargs: "reactive-rescue-session",
+            get_or_create=lambda *_args, **_kwargs: tracker,
+        )
+        proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
+        count_tokens = (
+            AsyncMock(return_value=None)
+            if count_results is None
+            else AsyncMock(side_effect=count_results)
+        )
+        proxy._count_anthropic_request_tokens = count_tokens
+        proxy.logger = SimpleNamespace(log=captured_logs.append)
+
+        def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
+            frozen = kwargs["frozen_message_count"]
+            pipeline_frozen_counts.append(frozen)
+            forwarded = json.loads(json.dumps(kwargs["messages"]))
+            if frozen == 0:
+                forwarded[0]["content"] = "reactive overflow rescue"
+                return _result(forwarded, marker="cache_pressure:upstream_context_rescue")
+            return _result(forwarded)
+
+        proxy.anthropic_pipeline.apply = apply_pipeline
+
+        async def fake_retry(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN202
+            sent_bodies.append(json.loads(json.dumps(body)))
+            return responses[len(sent_bodies) - 1]
+
+        proxy._retry_request = fake_retry
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "messages": tracker.previous_original
+                + [{"role": "user", "content": "new live turn"}],
+            },
+        )
+
+    return SimpleNamespace(
+        response=response,
+        tracker=tracker,
+        sent_bodies=sent_bodies,
+        captured_logs=captured_logs,
+        pipeline_frozen_counts=pipeline_frozen_counts,
+        count_tokens=count_tokens,
+    )
+
+
+def test_explicit_upstream_overflow_retries_once_without_a_simulated_trigger() -> None:
+    result = _run_context_overflow_rescue_case(
+        _CONTEXT_OVERFLOW_MESSAGE,
+        _upstream_success(),
+    )
+
+    assert result.response.status_code == 200
+    assert len(result.sent_bodies) == 2
+    assert result.sent_bodies[0]["messages"][0]["content"] == "cached forwarded request"
+    assert result.sent_bodies[1]["messages"][0]["content"] == "reactive overflow rescue"
+    assert result.tracker.previous_forwarded[0]["content"] == "reactive overflow rescue"
+    assert result.pipeline_frozen_counts.count(0) == 1
+    assert result.count_tokens.await_count == 0
+    tags = result.captured_logs[0].tags
+    assert tags["cache_pressure_decision"] == "accepted"
+    assert tags["cache_pressure_acceptance_reason"] == "upstream_context_rescue"
+    assert tags["cache_pressure_rescue_outcome"] == "succeeded"
+
+
+def test_rejected_economic_candidate_is_reused_only_after_real_overflow() -> None:
+    result = _run_context_overflow_rescue_case(
+        _CONTEXT_OVERFLOW_MESSAGE,
+        _upstream_success(),
+        pressure_tokens=299_200,
+        count_results=[317_212, 272_348],
+    )
+
+    assert result.response.status_code == 200
+    assert len(result.sent_bodies) == 2
+    assert result.sent_bodies[0]["messages"][0]["content"] == "cached forwarded request"
+    assert result.sent_bodies[1]["messages"][0]["content"] == "reactive overflow rescue"
+    assert result.pipeline_frozen_counts.count(0) == 1
+    assert result.count_tokens.await_count == 2
+    tags = result.captured_logs[0].tags
+    assert tags["cache_pressure_candidate_ratio"] == round(272_348 / 317_212, 6)
+    assert tags["cache_pressure_acceptance_reason"] == "upstream_context_rescue"
+
+
+def test_upstream_overflow_rescue_stops_after_one_failed_retry() -> None:
+    result = _run_context_overflow_rescue_case(
+        _CONTEXT_OVERFLOW_MESSAGE,
+        _upstream_error(_CONTEXT_OVERFLOW_MESSAGE),
+    )
+
+    assert result.response.status_code == 400
+    assert len(result.sent_bodies) == 2
+    assert result.sent_bodies[1]["messages"][0]["content"] == "reactive overflow rescue"
+    assert result.tracker.previous_forwarded[0]["content"] == "cached forwarded request"
+    assert result.pipeline_frozen_counts.count(0) == 1
+    assert result.captured_logs[0].tags["cache_pressure_rescue_outcome"] == "retry_failed"
+
+
+def test_unrelated_upstream_400_does_not_enter_overflow_rescue() -> None:
+    result = _run_context_overflow_rescue_case("Invalid tool schema", _upstream_success())
+
+    assert result.response.status_code == 400
+    assert len(result.sent_bodies) == 1
+    assert result.pipeline_frozen_counts.count(0) == 0
+    assert "cache_pressure_rescue_outcome" not in result.captured_logs[0].tags
+
+
+class _StreamingOverflowTransport(httpx.AsyncBaseTransport):
+    def __init__(self, *, retry_succeeds: bool) -> None:
+        self.retry_succeeds = retry_succeeds
+        self.bodies: list[dict[str, object]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        content = b"".join([chunk async for chunk in request.stream])
+        self.bodies.append(json.loads(content))
+        if len(self.bodies) == 1 or not self.retry_succeeds:
+            return _upstream_error(_CONTEXT_OVERFLOW_MESSAGE)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b"event: message_start\n"
+                b'data: {"type":"message_start","message":{"usage":'
+                b'{"input_tokens":10,"cache_creation_input_tokens":0,'
+                b'"cache_read_input_tokens":0}}}\n\n'
+                b"event: message_delta\n"
+                b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+                b'"usage":{"output_tokens":1}}\n\n'
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+        )
+
+
+async def _run_streaming_context_rescue(*, retry_succeeds: bool) -> SimpleNamespace:
+    proxy = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    ).state.proxy
+    transport = _StreamingOverflowTransport(retry_succeeds=retry_succeeds)
+    proxy.http_client = httpx.AsyncClient(transport=transport)
+    proxy._record_request_outcome = AsyncMock(return_value=None)
+    tracker = _Tracker()
+    baseline_body = {
+        "model": "gpt-5.6-sol",
+        "stream": True,
+        "messages": [{"role": "user", "content": "cached forwarded request"}],
+    }
+    rescue_body = {
+        **baseline_body,
+        "messages": [{"role": "user", "content": "reactive overflow rescue"}],
+    }
+    builder = AsyncMock(
+        return_value=UpstreamContextRescue(
+            body=rescue_body,
+            optimized_tokens=10,
+            transforms_applied=["cache_pressure:upstream_context_rescue"],
+            pipeline_timing={},
+            waste_signals=None,
+        )
+    )
+    tags: dict[str, str] = {}
+    try:
+        response = await proxy._stream_response(
+            "https://up.example/v1/messages",
+            {},
+            baseline_body,
+            "anthropic",
+            "gpt-5.6-sol",
+            "stream-rescue",
+            100,
+            100,
+            0,
+            [],
+            tags,
+            0.0,
+            prefix_tracker=tracker,
+            original_messages=baseline_body["messages"],
+            context_overflow_rescue_builder=builder,
+        )
+        body_bytes = b""
+        if hasattr(response, "body_iterator"):
+            body_bytes = b"".join([chunk async for chunk in response.body_iterator])
+        elif getattr(response, "body", None):
+            body_bytes = response.body
+    finally:
+        await proxy.http_client.aclose()
+
+    return SimpleNamespace(
+        response=response,
+        body_bytes=body_bytes,
+        transport=transport,
+        tracker=tracker,
+        builder=builder,
+        tags=tags,
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_overflow_retries_once_with_rescue_body() -> None:
+    result = await _run_streaming_context_rescue(retry_succeeds=True)
+
+    assert result.response.status_code == 200
+    assert len(result.transport.bodies) == 2
+    assert result.transport.bodies[1]["messages"][0]["content"] == (
+        "reactive overflow rescue"
+    )
+    assert b"message_stop" in result.body_bytes
+    assert result.tracker.previous_forwarded[0]["content"] == "reactive overflow rescue"
+    assert result.builder.await_count == 1
+    assert result.tags["cache_pressure_rescue_outcome"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_streaming_overflow_failed_retry_does_not_commit_rescue_body() -> None:
+    result = await _run_streaming_context_rescue(retry_succeeds=False)
+
+    assert result.response.status_code == 400
+    assert len(result.transport.bodies) == 2
+    assert result.tracker.previous_forwarded[0]["content"] == "cached forwarded request"
+    assert result.builder.await_count == 1
+    assert result.tags["cache_pressure_rescue_outcome"] == "retry_failed"
 
 
 def test_accepted_pressure_prefix_is_reused_by_next_cache_turn(monkeypatch) -> None:
