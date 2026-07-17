@@ -19,6 +19,7 @@ httpx = pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.ccr.tool_injection import create_ccr_tool_definition  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
@@ -60,13 +61,25 @@ def _tool_call_response() -> dict:
     }
 
 
+def _inject_proxy_ccr_tool(**kwargs) -> tuple[list[dict], bool]:  # noqa: ANN003
+    return list(kwargs.get("existing_tools") or []) + [
+        create_ccr_tool_definition("anthropic")
+    ], True
+
+
 def test_anthropic_ccr_exception_reraises_not_swallowed():
     """When CCR handle_response raises, the proxy must 500 — not silently return
     the raw headroom_retrieve tool-call body to the client."""
     config = _make_config()
     tool_resp = _tool_call_response()
 
-    with patch("headroom.proxy.server.AnyLLMBackend"):
+    with (
+        patch("headroom.proxy.server.AnyLLMBackend"),
+        patch(
+            "headroom.proxy.helpers.apply_session_sticky_ccr_tool",
+            side_effect=_inject_proxy_ccr_tool,
+        ),
+    ):
         app = create_app(config)
         with TestClient(app) as client:
             proxy = client.app.state.proxy

@@ -91,6 +91,21 @@ def has_ccr_tool_calls(response: dict[str, Any], provider: str) -> bool:
     return any(is_ccr_tool_call(tool_call) for tool_call in extract_tool_calls(response, provider))
 
 
+def should_handle_ccr_server_side(
+    *,
+    response_handler_enabled: bool,
+    client_had_ccr_tool: bool,
+    forwarded_has_ccr_tool: bool,
+) -> bool:
+    """Return whether the proxy owns execution of the forwarded CCR tool.
+
+    A tool present in the inbound request belongs to the client (for example,
+    Claude Code's Headroom MCP plugin).  Only a tool added while proxying is
+    eligible for transparent server-side execution.
+    """
+    return bool(response_handler_enabled and forwarded_has_ccr_tool and not client_had_ccr_tool)
+
+
 def tool_call_id_for_provider(tool_call: dict[str, Any], provider: str) -> str:
     """Return the provider-specific identifier used by the matching tool result."""
     if provider == "google":

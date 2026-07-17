@@ -49,6 +49,18 @@ def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> 
     }
 
 
+def _plugin_ccr_tool() -> dict:
+    tool = create_ccr_tool_definition("anthropic")
+    tool["name"] = "mcp__plugin_headroom_headroom__headroom_retrieve"
+    return tool
+
+
+def _inject_proxy_ccr_tool(**kwargs) -> tuple[list[dict], bool]:  # noqa: ANN003
+    return list(kwargs.get("existing_tools") or []) + [
+        create_ccr_tool_definition("anthropic")
+    ], True
+
+
 class _ContinuationClient:
     def __init__(self, response_json: dict) -> None:
         self.response_json = response_json
@@ -69,7 +81,7 @@ class _ContinuationClient:
         return None
 
 
-def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> None:
+def test_streaming_proxy_injected_headroom_retrieve_is_intercepted_and_returned_as_sse() -> None:
     config = _make_config()
     store = get_compression_store()
     hash_key = store.store(
@@ -92,7 +104,13 @@ def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> Non
         [{"type": "text", "text": "retrieved answer is now available"}]
     )
 
-    with patch("headroom.proxy.server.AnyLLMBackend"):
+    with (
+        patch("headroom.proxy.server.AnyLLMBackend"),
+        patch(
+            "headroom.proxy.helpers.apply_session_sticky_ccr_tool",
+            side_effect=_inject_proxy_ccr_tool,
+        ),
+    ):
         app = create_app(config)
         with TestClient(app) as client:
             proxy = client.app.state.proxy
@@ -123,7 +141,6 @@ def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> Non
                     "model": "claude-sonnet-4-6",
                     "max_tokens": 64,
                     "stream": True,
-                    "tools": [create_ccr_tool_definition("anthropic")],
                     "messages": [{"role": "user", "content": "retrieve it"}],
                 },
             )
@@ -179,28 +196,28 @@ def test_streaming_without_headroom_retrieve_uses_normal_streaming_path() -> Non
     proxy._stream_response.assert_awaited_once()
 
 
-def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> None:
+def test_streaming_with_client_owned_headroom_retrieve_uses_live_stream(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "mcp__plugin_headroom_headroom__")
     config = _make_config()
-    text_response = _message_response([{"type": "text", "text": "plain answer"}])
 
     with patch("headroom.proxy.server.AnyLLMBackend"):
         app = create_app(config)
         with TestClient(app) as client:
             proxy = client.app.state.proxy
-            proxy._stream_response = AsyncMock(
-                side_effect=AssertionError("live streaming path should not be used")
+
+            async def _fake_stream_response(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+                assert args[2]["stream"] is True
+
+                async def _gen():
+                    yield b"event: message_stop\n"
+                    yield b'data: {"type":"message_stop"}\n\n'
+
+                return StreamingResponse(_gen(), media_type="text/event-stream")
+
+            proxy._stream_response = AsyncMock(side_effect=_fake_stream_response)
+            proxy._retry_request = AsyncMock(
+                side_effect=AssertionError("client-owned CCR must not use buffered upstream")
             )
-            continuation_client = _ContinuationClient(_message_response([]))
-            proxy.http_client = continuation_client
-            initial_bodies: list[dict] = []
-
-            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
-                initial_bodies.append(json.loads(json.dumps(body)))
-                assert stream is False
-                assert body["stream"] is False
-                return httpx.Response(200, json=text_response)
-
-            proxy._retry_request = _fake_retry  # type: ignore[assignment]
 
             resp = client.post(
                 "/v1/messages",
@@ -209,18 +226,67 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
                     "model": "claude-sonnet-4-6",
                     "max_tokens": 64,
                     "stream": True,
-                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "tools": [_plugin_ccr_tool()],
                     "messages": [{"role": "user", "content": "hello"}],
                 },
             )
 
     assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    assert "plain answer" in resp.text
-    assert "headroom_retrieve" not in resp.text
-    assert initial_bodies and initial_bodies[0]["stream"] is False
+    assert '"message_stop"' in resp.text
+    proxy._stream_response.assert_awaited_once()
+    proxy._retry_request.assert_not_awaited()
+
+
+def test_nonstreaming_client_owned_headroom_retrieve_is_returned_to_client(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_MCP_TOOL_PREFIX", "mcp__plugin_headroom_headroom__")
+    config = _make_config()
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"secret": "client should retrieve this"}),
+        compressed="{}",
+        original_item_count=1,
+    )
+    client_tool_name = "mcp__plugin_headroom_headroom__headroom_retrieve"
+    initial_response = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_client_ccr",
+                "name": client_tool_name,
+                "input": {"hash": hash_key},
+            }
+        ],
+        stop_reason="tool_use",
+    )
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            continuation_client = _ContinuationClient(
+                _message_response([{"type": "text", "text": "proxy continuation"}])
+            )
+            proxy.http_client = continuation_client
+            proxy._retry_request = AsyncMock(
+                return_value=httpx.Response(200, json=initial_response)
+            )
+
+            resp = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": False,
+                    "tools": [_plugin_ccr_tool()],
+                    "messages": [{"role": "user", "content": "retrieve it"}],
+                },
+            )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["content"][0]["name"] == client_tool_name
     assert continuation_client.post_calls == []
-    proxy._stream_response.assert_not_awaited()
 
 
 def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
@@ -243,7 +309,13 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
         stop_reason="tool_use",
     )
 
-    with patch("headroom.proxy.server.AnyLLMBackend"):
+    with (
+        patch("headroom.proxy.server.AnyLLMBackend"),
+        patch(
+            "headroom.proxy.helpers.apply_session_sticky_ccr_tool",
+            side_effect=_inject_proxy_ccr_tool,
+        ),
+    ):
         app = create_app(config)
         with TestClient(app) as client:
             proxy = client.app.state.proxy
@@ -264,7 +336,6 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [
-                        create_ccr_tool_definition("anthropic"),
                         {
                             "name": "client_tool",
                             "description": "Client-owned tool",

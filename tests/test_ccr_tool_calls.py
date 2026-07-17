@@ -5,6 +5,7 @@ from headroom.ccr.tool_calls import (
     extract_tool_calls,
     has_ccr_tool_calls,
     parse_ccr_tool_calls,
+    should_handle_ccr_server_side,
     tool_call_id_for_provider,
 )
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
@@ -55,6 +56,29 @@ def test_has_ccr_tool_calls_uses_provider_native_names() -> None:
     assert not has_ccr_tool_calls(
         {"content": [{"type": "tool_use", "name": "read_file", "input": {"hash": HASH}}]},
         "anthropic",
+    )
+
+
+def test_server_side_ccr_handling_requires_proxy_owned_tool() -> None:
+    assert should_handle_ccr_server_side(
+        response_handler_enabled=True,
+        client_had_ccr_tool=False,
+        forwarded_has_ccr_tool=True,
+    )
+    assert not should_handle_ccr_server_side(
+        response_handler_enabled=True,
+        client_had_ccr_tool=True,
+        forwarded_has_ccr_tool=True,
+    )
+    assert not should_handle_ccr_server_side(
+        response_handler_enabled=True,
+        client_had_ccr_tool=False,
+        forwarded_has_ccr_tool=False,
+    )
+    assert not should_handle_ccr_server_side(
+        response_handler_enabled=False,
+        client_had_ccr_tool=False,
+        forwarded_has_ccr_tool=True,
     )
 
 

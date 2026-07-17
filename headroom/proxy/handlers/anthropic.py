@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr.tool_calls import should_handle_ccr_server_side
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -749,6 +750,9 @@ class AnthropicHandlerMixin:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
+            client_has_ccr_retrieve_tool = self._has_headroom_retrieve_tool(
+                body.get("tools")
+            )
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
             # tags assistant blocks with an "index" for SSE re-emission; clients (e.g.
@@ -2849,13 +2853,15 @@ class AnthropicHandlerMixin:
                 ccr_response_handler_enabled = bool(
                     self.ccr_response_handler and getattr(ccr_handler_config, "enabled", True)
                 )
-                buffered_stream_ccr = bool(
-                    stream
-                    and ccr_response_handler_enabled
-                    and self._has_headroom_retrieve_tool(
-                        tools if tools is not None else body.get("tools")
-                    )
+                forwarded_has_ccr_retrieve_tool = self._has_headroom_retrieve_tool(
+                    tools if tools is not None else body.get("tools")
                 )
+                server_handles_ccr = should_handle_ccr_server_side(
+                    response_handler_enabled=ccr_response_handler_enabled,
+                    client_had_ccr_tool=client_has_ccr_retrieve_tool,
+                    forwarded_has_ccr_tool=forwarded_has_ccr_retrieve_tool,
+                )
+                buffered_stream_ccr = bool(stream and server_handles_ccr)
                 if buffered_stream_ccr:
                     if body.get("stream") is not False:
                         body["stream"] = False
@@ -3147,7 +3153,8 @@ class AnthropicHandlerMixin:
 
                     # CCR Response Handling: Handle headroom_retrieve tool calls automatically
                     if (
-                        self.ccr_response_handler
+                        server_handles_ccr
+                        and self.ccr_response_handler
                         and resp_json
                         and response.status_code == 200
                         and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "anthropic")
@@ -3591,7 +3598,8 @@ class AnthropicHandlerMixin:
                             return f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
                         if (
-                            self.ccr_response_handler
+                            server_handles_ccr
+                            and self.ccr_response_handler
                             and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "anthropic")
                         ):
                             logger.warning(
