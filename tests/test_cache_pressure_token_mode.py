@@ -161,6 +161,31 @@ def test_streaming_message_delta_preserves_cli_proxy_usage_fields() -> None:
     }
 
 
+def test_buffered_streaming_usage_keeps_missing_cache_fields_unknown() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    state = {
+        "sse_buffer": bytearray(
+            b"event: message_start\n"
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n'
+            b"event: message_delta\n"
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+            b'"usage":{"input_tokens":887,"output_tokens":84}}\n\n'
+        )
+    }
+
+    with TestClient(app) as client:
+        usage = client.app.state.proxy._parse_sse_usage_from_buffer(state, "anthropic")
+
+    assert usage == {"input_tokens": 887, "output_tokens": 84}
+
+
 def test_streaming_message_delta_does_not_erase_message_start_ttl_usage() -> None:
     app = create_app(
         ProxyConfig(
@@ -404,6 +429,7 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
     [
         (299_199, None, None, "cached forwarded request", "below_threshold"),
         (299_200, None, None, "cached forwarded request", "count_unavailable"),
+        (299_200, 299_199, None, "cached forwarded request", "exact_below_threshold"),
         (299_200, 350_000, 227_500, "pressure-compressed history", "accepted"),
         (299_200, 350_000, 227_501, "cached forwarded request", "insufficient_reduction"),
         (299_200, 404_166, 331_602, "cached forwarded request", "insufficient_reduction"),
@@ -503,10 +529,14 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     assert sent_messages[0]["content"] == expected_first_content
     assert tracker.previous_forwarded[0]["content"] == expected_first_content
     expected_count_calls = (
-        0 if expected_decision == "below_threshold" else 1 if baseline_tokens is None else 2
+        0
+        if expected_decision == "below_threshold"
+        else 1
+        if baseline_tokens is None or expected_decision == "exact_below_threshold"
+        else 2
     )
     assert count_tokens.await_count == expected_count_calls
-    if expected_decision in {"below_threshold", "count_unavailable"}:
+    if expected_decision in {"below_threshold", "count_unavailable", "exact_below_threshold"}:
         assert pressure_pipeline_kwargs == {}
     else:
         assert pressure_pipeline_kwargs["target_ratio"] == 0.12
@@ -531,7 +561,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
             candidate_tokens / baseline_tokens,
             6,
         )
-    if expected_decision in {"below_threshold", "count_unavailable"}:
+    if expected_decision in {"below_threshold", "count_unavailable", "exact_below_threshold"}:
         assert "cache_pressure_target_ratio" not in tags
     else:
         assert tags["cache_pressure_target_ratio"] == 0.12

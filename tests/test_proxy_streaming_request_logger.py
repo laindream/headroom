@@ -47,6 +47,12 @@ def _stream_state(output_tokens: int = 42) -> dict:
         "cache_creation_input_tokens": 0,
         "cache_creation_ephemeral_5m_input_tokens": 0,
         "cache_creation_ephemeral_1h_input_tokens": 0,
+        "usage_fields_seen": {
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        },
         "sse_buffer": "",
     }
 
@@ -193,7 +199,38 @@ async def test_streaming_finalizer_records_original_to_forwarded_prefix_mapping(
         messages=forwarded + [assistant],
         original_messages=original + [assistant],
         response_total_tokens=1_005,
+        cache_usage_known=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_streaming_finalizer_does_not_anchor_incomplete_anthropic_usage():
+    """Missing cache fields are unknown, not authoritative zeros."""
+
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    tracker = SimpleNamespace(update_from_response=MagicMock())
+    state = _stream_state(output_tokens=84)
+    state["input_tokens"] = 887
+    state["usage_fields_seen"] = {"input_tokens", "output_tokens"}
+
+    await proxy._finalize_stream_response(
+        body={"messages": [{"role": "user", "content": "large cached request"}]},
+        provider="anthropic",
+        model="gpt-5.6-sol",
+        request_id="req-incomplete-stream-usage",
+        original_tokens=330_000,
+        optimized_tokens=300_000,
+        tokens_saved=30_000,
+        transforms_applied=[],
+        optimization_latency=1.0,
+        stream_state=state,
+        start_time=0.0,
+        prefix_tracker=tracker,
+    )
+
+    tracker_update = tracker.update_from_response.call_args.kwargs
+    assert tracker_update["response_total_tokens"] is None
+    assert tracker_update["cache_usage_known"] is False
 
 
 @pytest.mark.asyncio

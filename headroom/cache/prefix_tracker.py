@@ -469,6 +469,7 @@ class PrefixCacheTracker:
         message_token_counts: list[int] | None = None,
         original_messages: list[dict[str, Any]] | None = None,
         response_total_tokens: int | None = None,
+        cache_usage_known: bool = True,
     ) -> None:
         """Update tracker with cache metrics from the API response.
 
@@ -481,6 +482,9 @@ class PrefixCacheTracker:
             messages: The messages that were sent to the API.
             message_token_counts: Pre-computed token counts per message.
                 If None, estimates from content length.
+            cache_usage_known: Whether the response explicitly reported cache
+                read/write fields. False updates the turn mapping while
+                preserving the last provider-confirmed frozen prefix.
         """
         self._last_activity = time.time()
         self._turn_number += 1
@@ -493,6 +497,14 @@ class PrefixCacheTracker:
             and response_total_tokens > 0
             else None
         )
+
+        if not cache_usage_known:
+            logger.debug(
+                "PrefixCacheTracker[%s]: cache usage unavailable; preserving "
+                "last confirmed frozen prefix",
+                self.provider,
+            )
+            return
 
         # Compute total cached tokens (read + write = what's in cache now)
         total_cached = cache_read_tokens + cache_write_tokens

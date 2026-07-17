@@ -102,6 +102,34 @@ class TestPrefixCacheTracker:
         # Turn 2: should freeze what was written
         assert tracker.get_frozen_message_count() == 2
 
+    def test_unknown_cache_usage_preserves_last_confirmed_prefix(self, tracker):
+        confirmed = [
+            {"role": "user", "content": "cached request"},
+            {"role": "assistant", "content": "cached answer"},
+        ]
+        current = confirmed + [{"role": "user", "content": "new turn"}]
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=2_000,
+            messages=confirmed,
+            message_token_counts=[1_000, 1_000],
+            response_total_tokens=2_100,
+        )
+
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            messages=current,
+            original_messages=current,
+            response_total_tokens=None,
+            cache_usage_known=False,
+        )
+
+        assert tracker.get_frozen_message_count() == 2
+        assert tracker.get_last_forwarded_messages() == current
+        assert tracker.get_last_original_messages() == current
+        assert tracker.get_last_response_total_tokens() is None
+
     def test_min_cached_tokens_threshold(self):
         """Below min_cached_tokens, no freeze."""
         config = PrefixFreezeConfig(min_cached_tokens=2000)

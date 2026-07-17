@@ -195,18 +195,19 @@ class StreamingMixin:
                         msg = data.get("message", {})
                         msg_usage = msg.get("usage", {})
                         if msg_usage:
-                            usage["input_tokens"] = msg_usage.get("input_tokens", 0)
-                            usage["cache_read_input_tokens"] = msg_usage.get(
-                                "cache_read_input_tokens", 0
-                            )
-                            usage["cache_creation_input_tokens"] = msg_usage.get(
-                                "cache_creation_input_tokens", 0
-                            )
-                            cache_write_5m, cache_write_1h = (
-                                self._extract_anthropic_cache_ttl_metrics(msg_usage)
-                            )
-                            usage["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
-                            usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
+                            for key in (
+                                "input_tokens",
+                                "cache_read_input_tokens",
+                                "cache_creation_input_tokens",
+                            ):
+                                if key in msg_usage:
+                                    usage[key] = msg_usage[key]
+                            if "cache_creation" in msg_usage:
+                                cache_write_5m, cache_write_1h = (
+                                    self._extract_anthropic_cache_ttl_metrics(msg_usage)
+                                )
+                                usage["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
+                                usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
 
                     elif event_type == "message_delta":
                         delta_usage = data.get("usage", {})
@@ -306,18 +307,19 @@ class StreamingMixin:
                     msg = data.get("message", {})
                     msg_usage = msg.get("usage", {})
                     if msg_usage:
-                        usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
-                        usage_found["cache_read_input_tokens"] = msg_usage.get(
-                            "cache_read_input_tokens", 0
-                        )
-                        usage_found["cache_creation_input_tokens"] = msg_usage.get(
-                            "cache_creation_input_tokens", 0
-                        )
-                        cache_write_5m, cache_write_1h = self._extract_anthropic_cache_ttl_metrics(
-                            msg_usage
-                        )
-                        usage_found["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
-                        usage_found["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
+                        for key in (
+                            "input_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        ):
+                            if key in msg_usage:
+                                usage_found[key] = msg_usage[key]
+                        if "cache_creation" in msg_usage:
+                            cache_write_5m, cache_write_1h = (
+                                self._extract_anthropic_cache_ttl_metrics(msg_usage)
+                            )
+                            usage_found["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
+                            usage_found["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
                         logger.debug(
                             f"[CACHE] Anthropic usage: input={usage_found.get('input_tokens')}, "
                             f"cache_read={usage_found.get('cache_read_input_tokens')}, "
@@ -326,7 +328,14 @@ class StreamingMixin:
                 elif event_type == "message_delta":
                     delta_usage = data.get("usage", {})
                     if delta_usage:
-                        usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
+                        for key in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        ):
+                            if key in delta_usage:
+                                usage_found[key] = delta_usage[key]
 
             elif provider == "openai":
                 chunk_usage = data.get("usage")
@@ -863,6 +872,9 @@ class StreamingMixin:
         if isinstance(sse_buffer, bytearray) and len(sse_buffer) > 0:
             sse_buffer.extend(b"\n\n")
             late_usage = self._parse_sse_usage_from_buffer(stream_state, provider) or {}
+            usage_fields_seen = stream_state.get("usage_fields_seen")
+            if isinstance(usage_fields_seen, set):
+                usage_fields_seen.update(late_usage)
             for key in (
                 "input_tokens",
                 "output_tokens",
@@ -904,6 +916,15 @@ class StreamingMixin:
         cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
         cache_write_5m_tokens = stream_state["cache_creation_ephemeral_5m_input_tokens"] or 0
         cache_write_1h_tokens = stream_state["cache_creation_ephemeral_1h_input_tokens"] or 0
+        usage_fields_seen = stream_state.get("usage_fields_seen")
+        cache_usage_known = not (
+            provider == "anthropic"
+            and isinstance(usage_fields_seen, set)
+            and not {
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            }.issubset(usage_fields_seen)
+        )
         uncached_input_tokens = max(
             effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
         )
@@ -937,7 +958,11 @@ class StreamingMixin:
             # append) against last turn's.
             # `hasattr` guard: stub trackers in tests may implement only the
             # freeze API, not the full PrefixCacheTracker surface.
-            if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
+            if (
+                provider == "anthropic"
+                and cache_usage_known
+                and hasattr(prefix_tracker, "classify_cache_miss")
+            ):
                 miss = prefix_tracker.classify_cache_miss(
                     cache_read_tokens=cache_read_tokens,
                     current_forwarded_messages=forwarded_messages,
@@ -951,13 +976,16 @@ class StreamingMixin:
                     )
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
-            prefix_tracker.update_from_response(
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                messages=next_forwarded,
-                original_messages=next_original,
-                response_total_tokens=(
-                    anthropic_usage_total_tokens(
+            response_total_tokens = None
+            if provider == "anthropic":
+                required_usage_fields = {
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                }
+                if usage_fields_seen is None or required_usage_fields.issubset(usage_fields_seen):
+                    response_total_tokens = anthropic_usage_total_tokens(
                         {
                             "input_tokens": provider_input_tokens,
                             "cache_creation_input_tokens": cache_write_tokens,
@@ -965,9 +993,14 @@ class StreamingMixin:
                             "output_tokens": reported_output_tokens,
                         }
                     )
-                    if provider == "anthropic"
-                    else None
-                ),
+
+            prefix_tracker.update_from_response(
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                messages=next_forwarded,
+                original_messages=next_original,
+                response_total_tokens=response_total_tokens,
+                cache_usage_known=cache_usage_known,
             )
 
         # Active-compression denominator (``attempted_input_tokens``) is
@@ -1182,6 +1215,10 @@ class StreamingMixin:
             "cache_creation_input_tokens": 0,
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
+            # Cache usage fields are optional in Anthropic SSE. Preserve
+            # presence separately so missing values cannot masquerade as
+            # authoritative zeros in the next-turn context anchor.
+            "usage_fields_seen": set(),
             "total_bytes": 0,
             # Buffer for incomplete SSE events (bytes, per PR-A8 / P1-8).
             # We split events on the ``\n\n`` byte sequence and decode
@@ -1595,6 +1632,7 @@ class StreamingMixin:
                         # Parse complete SSE events from buffer
                         usage = self._parse_sse_usage_from_buffer(stream_state, provider)
                         if usage:
+                            stream_state["usage_fields_seen"].update(usage)
                             if "input_tokens" in usage:
                                 stream_state["input_tokens"] = usage["input_tokens"]
                             if "output_tokens" in usage:

@@ -1653,8 +1653,18 @@ class AnthropicHandlerMixin:
                         tags["cache_pressure_decision"] = "count_unavailable"
                     else:
                         tags["cache_pressure_baseline_tokens"] = baseline_tokens
+                    exact_threshold_met = (
+                        baseline_tokens is not None
+                        and should_attempt_cache_pressure(
+                            baseline_tokens,
+                            context_limit,
+                            self.config.cache_pressure_trigger_ratio,
+                        )
+                    )
+                    if baseline_tokens is not None and not exact_threshold_met:
+                        tags["cache_pressure_decision"] = "exact_below_threshold"
                     try:
-                        if baseline_tokens is None:
+                        if not exact_threshold_met:
                             raise RuntimeError("cache-pressure baseline count unavailable")
                         from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
                         from headroom.transforms.compression_policy import resolve_policy
@@ -1745,7 +1755,7 @@ class AnthropicHandlerMixin:
                                 self.config.cache_pressure_max_output_ratio,
                             )
                     except Exception as exc:
-                        if baseline_tokens is not None:
+                        if exact_threshold_met:
                             tags["cache_pressure_decision"] = "candidate_failed"
                             logger.warning(
                                 "[%s] Cache-pressure candidate failed (%s); "
