@@ -1272,6 +1272,10 @@ class AnthropicHandlerMixin:
                         for tool in (body.get("tools") or [])
                         if isinstance(tool, dict)
                     }
+                    has_existing_ccr_retrieve_tool = any(
+                        is_headroom_mcp_tool_name(name, CCR_TOOL_NAME)
+                        for name in existing_tool_names
+                    )
 
                     def should_skip_ccr_request_compression(
                         current_frozen_message_count: int,
@@ -1282,10 +1286,7 @@ class AnthropicHandlerMixin:
                         return (
                             self.config.ccr_inject_tool
                             and current_frozen_message_count > 0
-                            and not any(
-                                is_headroom_mcp_tool_name(name, CCR_TOOL_NAME)
-                                for name in existing_tool_names
-                            )
+                            and not has_existing_ccr_retrieve_tool
                         )
 
                     if is_token_mode(self.config.mode):
