@@ -1037,6 +1037,22 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
         "description": "Retrieve compressed content",
         "input_schema": {"type": "object", "properties": {}},
     }
+    # Tool availability is a request-entry fact.  A later matcher read can
+    # observe transient process state (for example while a plugin prefix is
+    # being refreshed), but must not revoke CCR for the request already parsed.
+    from headroom import mcp_tool_names
+
+    original_matcher = mcp_tool_names.is_headroom_mcp_tool_name
+    matcher_calls = 0
+
+    def _transient_matcher(name, canonical_name, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal matcher_calls
+        matcher_calls += 1
+        if matcher_calls == 2:
+            return False
+        return original_matcher(name, canonical_name, **kwargs)
+
+    monkeypatch.setattr(mcp_tool_names, "is_headroom_mcp_tool_name", _transient_matcher)
     _force_compression(monkeypatch)
 
     with _make_proxy_client() as client:
