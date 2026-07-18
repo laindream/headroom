@@ -1105,6 +1105,13 @@ def proxy(
         cache_pressure_count_timeout_seconds=_get_env_float(
             "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
         ),
+        lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
+        protect_recent_tool_result_turns=_get_env_int(
+            "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS", 2
+        ),
+        lossy_tool_allowlist=frozenset(
+            _parse_csv_tools(os.environ.get("HEADROOM_LOSSY_TOOL_ALLOWLIST"))
+        ),
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,

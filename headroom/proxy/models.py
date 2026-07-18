@@ -132,6 +132,13 @@ class ProxyConfig:
     cache_pressure_max_output_ratio: float = 0.50
     cache_pressure_count_timeout_seconds: float = 5.0
 
+    # Strict coding-agent safety boundary. When enabled, lossy transforms may
+    # mutate only old, explicitly allowlisted tool results. Unknown tools,
+    # recent results, and every user/system/assistant text field remain exact.
+    lossy_tool_results_only: bool = False
+    protect_recent_tool_result_turns: int = 2
+    lossy_tool_allowlist: frozenset[str] = field(default_factory=frozenset)
+
     # Optimization
     optimize: bool = True
     image_optimize: bool = True

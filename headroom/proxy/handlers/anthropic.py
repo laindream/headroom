@@ -1840,7 +1840,11 @@ class AnthropicHandlerMixin:
             # request. Session state (matured markers) rides on the
             # prefix tracker — same affinity and TTL cleanup as the
             # freeze state. Advisory: must never fail the request.
-            if self.config.read_maturation and not _bypass:
+            if (
+                self.config.read_maturation
+                and not self.config.lossy_tool_results_only
+                and not _bypass
+            ):
                 try:
                     from headroom.config import ReadMaturationConfig
                     from headroom.transforms.read_maturation import (

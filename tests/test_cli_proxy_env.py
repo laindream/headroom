@@ -1252,6 +1252,32 @@ class TestCLIProxyExcludeToolsEnvVar:
         assert captured_config["config"].tool_profiles is None
 
 
+class TestCLIStrictLossyScopeEnv:
+    def test_strict_scope_env_reaches_proxy_config(self, runner):
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={
+                    "HEADROOM_LOSSY_TOOL_RESULTS_ONLY": "1",
+                    "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS": "3",
+                    "HEADROOM_LOSSY_TOOL_ALLOWLIST": "Bash,Shell",
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.lossy_tool_results_only is True
+        assert cfg.protect_recent_tool_result_turns == 3
+        assert cfg.lossy_tool_allowlist == frozenset({"Bash", "bash", "Shell", "shell"})
+
+
 class TestCLIProxyRpmTpm:
     """--rpm/--tpm flags and HEADROOM_RPM/HEADROOM_TPM env vars must reach ProxyConfig."""
 

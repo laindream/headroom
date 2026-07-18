@@ -58,6 +58,9 @@ class AgentSavingsProfile:
     effort_router: bool = True
     lossless: bool = False
     min_chars_for_block: int | None = None
+    lossy_tool_results_only: bool = False
+    protect_recent_tool_result_turns: int = 2
+    lossy_tool_allowlist: tuple[str, ...] = ()
 
     @property
     def savings_percent(self) -> int:
@@ -97,6 +100,12 @@ class AgentSavingsProfile:
         # Block-compression char floor: only emit when the profile pins one.
         if self.min_chars_for_block is not None:
             env["HEADROOM_MIN_CHARS_FOR_BLOCK"] = str(self.min_chars_for_block)
+        if self.lossy_tool_results_only:
+            env["HEADROOM_LOSSY_TOOL_RESULTS_ONLY"] = "1"
+            env["HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS"] = str(
+                self.protect_recent_tool_result_turns
+            )
+            env["HEADROOM_LOSSY_TOOL_ALLOWLIST"] = ",".join(self.lossy_tool_allowlist)
         return env
 
     def apply_proxy_env_defaults(self, env: MutableMapping[str, str]) -> MutableMapping[str, str]:
@@ -152,11 +161,10 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         name="coding",
         target_savings=0.50,  # nominal (display only); savings are emergent
         target_ratio=None,
-        # Cache mode compresses only the newest delta — a tool/user OBSERVATION —
-        # so compress_user must be ON or there is nothing to compress. Prefix
-        # stability (no bust) is preserved by the delta engine (frozen prefix +
-        # append-only forwarding), not by refusing to touch user turns.
-        compress_user_messages=True,
+        # Anthropic tool_result blocks are routed independently even though they
+        # live inside role=user messages. Keep actual user prose byte-identical;
+        # text-only harness observations trade compression for the same safety.
+        compress_user_messages=False,
         compress_system_messages=False,  # system prompt is the hottest cache
         protect_recent=2,  # keep the active code working set verbatim
         protect_analysis_context=True,
@@ -179,6 +187,9 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         effort_router=False,
         lossless=False,
         min_chars_for_block=25,
+        lossy_tool_results_only=True,
+        protect_recent_tool_result_turns=2,
+        lossy_tool_allowlist=("Bash",),
     ),
     "general": AgentSavingsProfile(
         name="general",
@@ -288,6 +299,9 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
                 "smart_crusher_with_compaction": profile.smart_crusher_with_compaction,
                 "force_kompress": profile.force_kompress,
                 "read_protection_window": profile.protect_recent,
+                "lossy_tool_results_only": profile.lossy_tool_results_only,
+                "protect_recent_tool_result_turns": profile.protect_recent_tool_result_turns,
+                "lossy_tool_allowlist": frozenset(profile.lossy_tool_allowlist),
             }
         )
         # Only pin a keep-ratio when the profile sets one (personas leave it

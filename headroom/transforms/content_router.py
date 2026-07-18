@@ -299,6 +299,62 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     return prog in search_commands
 
 
+_DISPOSABLE_SHELL_PROGRAMS = frozenset(
+    {
+        "pytest",
+        "py.test",
+        "ruff",
+        "mypy",
+        "pyright",
+        "eslint",
+        "tsc",
+        "jest",
+        "vitest",
+        "ninja",
+        "xcodebuild",
+    }
+)
+_DISPOSABLE_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "cargo": frozenset({"build", "check", "clippy", "test"}),
+    "go": frozenset({"test", "vet"}),
+    "npm": frozenset({"build", "lint", "test"}),
+    "pnpm": frozenset({"build", "check", "lint", "test"}),
+    "yarn": frozenset({"build", "check", "lint", "test"}),
+    "bun": frozenset({"build", "lint", "test"}),
+    "bazel": frozenset({"build", "test"}),
+    "gradle": frozenset({"build", "check", "lint", "test"}),
+    "gradlew": frozenset({"build", "check", "lint", "test"}),
+    "mvn": frozenset({"package", "test", "verify"}),
+    "mvnw": frozenset({"package", "test", "verify"}),
+    "swift": frozenset({"build", "test"}),
+}
+_DISPOSABLE_MAKE_TARGETS = frozenset({"build", "check", "ci", "lint", "test", "verify"})
+
+
+def _is_disposable_shell_output_command(command: str) -> bool:
+    """Conservatively admit only standalone build/test/lint command output.
+
+    Strict lossy scope defaults unknown shell commands to protected. Shell
+    composition is rejected because an otherwise-safe test command could append
+    a plan/read/authorization payload whose output must remain exact.
+    """
+    command = _strip_cd_prefix(command)
+    if not command or re.search(r"&&|\|\||[;|`]|\$\(", command):
+        return False
+    prog, rest = _bash_program(command)
+    if prog in _DISPOSABLE_SHELL_PROGRAMS:
+        return True
+    if prog == "python" and len(rest) >= 2 and rest[0] == "-m":
+        return rest[1].lower() in _DISPOSABLE_SHELL_PROGRAMS
+    if prog in {"uv", "poetry", "pipenv"} and rest and rest[0].lower() == "run":
+        return _is_disposable_shell_output_command(" ".join(rest[1:]))
+    if prog == "make":
+        targets = {token.lower() for token in rest if token and not token.startswith("-")}
+        return bool(targets) and targets <= _DISPOSABLE_MAKE_TARGETS
+    allowed_subcommands = _DISPOSABLE_SUBCOMMANDS.get(prog)
+    return bool(rest and allowed_subcommands and rest[0].lower() in allowed_subcommands)
+
+
 def _log_router_debug(event: str, **payload: Any) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
@@ -1065,6 +1121,15 @@ class ContentRouterConfig:
     # backends that don't honor cache_control AND whose compressors
     # are byte-deterministic.
     compress_assistant_text_blocks: bool = False
+
+    # Strict coding-agent boundary: lossy transforms may touch only old,
+    # explicitly allowlisted tool results. User/system/assistant prose and
+    # recent or unknown tool results stay byte-identical. This is stronger than
+    # the role gates above because Anthropic carries tool_result blocks inside a
+    # role=user message and some OpenAI-compatible clients use plain strings.
+    lossy_tool_results_only: bool = False
+    protect_recent_tool_result_turns: int = 2
+    lossy_tool_allowlist: frozenset[str] = field(default_factory=frozenset)
 
     # Minimum content length (in chars) at which a text or tool_result
     # block is considered for compression. Below this, the overhead of
@@ -3115,6 +3180,165 @@ class ContentRouter(Transform):
         self._tool_call_commands = commands_map
         return mapping
 
+    @staticmethod
+    def _tool_result_turn_indices(messages: list[dict[str, Any]]) -> list[set[int]]:
+        """Group contiguous tool-result messages into logical result turns."""
+        groups: list[set[int]] = []
+        previous_idx = -2
+        for idx, message in enumerate(messages):
+            content = message.get("content")
+            has_result = message.get("role") in {"tool", "function"} or (
+                isinstance(content, list)
+                and any(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in content
+                )
+            )
+            if not has_result:
+                continue
+            if groups and idx == previous_idx + 1:
+                groups[-1].add(idx)
+            else:
+                groups.append({idx})
+            previous_idx = idx
+        return groups
+
+    @staticmethod
+    def _tool_result_text(content: Any) -> str | None:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list) and all(
+            isinstance(block, dict) and block.get("type") == "text" for block in content
+        ):
+            return "".join(str(block.get("text", "")) for block in content)
+        return None
+
+    def _strict_lossy_locations(
+        self,
+        messages: list[dict[str, Any]],
+        tool_name_map: dict[str, str],
+        excluded_tool_ids: set[str],
+        frozen_message_count: int,
+    ) -> tuple[set[int], set[tuple[int, int]]]:
+        """Return message/block content locations eligible for lossy mutation."""
+        if not self.config.lossy_tool_results_only:
+            return set(), set()
+
+        groups = self._tool_result_turn_indices(messages)
+        protect_turns = max(0, self.config.protect_recent_tool_result_turns)
+        recent_indices = set().union(*groups[-protect_turns:]) if protect_turns else set()
+        allowlist = self.config.lossy_tool_allowlist
+        allowed_messages: set[int] = set()
+        allowed_blocks: set[tuple[int, int]] = set()
+
+        def eligible(
+            *,
+            message_idx: int,
+            tool_id: str,
+            tool_name: str,
+            content: Any,
+            is_error: bool,
+            cache_control: bool,
+        ) -> bool:
+            if message_idx in recent_indices or cache_control or is_error:
+                return False
+            if not tool_name or not is_tool_excluded(tool_name, allowlist):
+                return False
+            if tool_name.lower() in self.config.bash_tool_names and not (
+                _is_disposable_shell_output_command(self._tool_call_commands.get(tool_id, ""))
+            ):
+                return False
+            if tool_id in excluded_tool_ids:
+                return False
+            text = self._tool_result_text(content)
+            if text is None:
+                return False
+            # Strict mode protects failures at every size. Large failing logs
+            # contain the exact traceback/diagnostic needed for recovery; the
+            # normal router's size-based relaxation is intentionally not used.
+            if self.config.protect_error_outputs and content_has_strong_error_indicators(text):
+                return False
+            if tool_id in getattr(self, "_protect_read_tool_ids", ()) and (
+                _read_output_should_be_protected(text)
+            ):
+                return False
+            return True
+
+        for message_idx, message in enumerate(messages):
+            if message_idx < frozen_message_count:
+                continue
+            content = message.get("content")
+            role = message.get("role")
+            if role in {"tool", "function"}:
+                tool_id = str(message.get("tool_call_id") or message.get("tool_use_id") or "")
+                tool_name = tool_name_map.get(tool_id) or str(message.get("name") or "")
+                if eligible(
+                    message_idx=message_idx,
+                    tool_id=tool_id,
+                    tool_name=tool_name,
+                    content=content,
+                    is_error=bool(message.get("is_error")),
+                    cache_control="cache_control" in message,
+                ):
+                    allowed_messages.add(message_idx)
+                continue
+            if not isinstance(content, list):
+                continue
+            for block_idx, block in enumerate(content):
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_id = str(block.get("tool_use_id") or "")
+                if eligible(
+                    message_idx=message_idx,
+                    tool_id=tool_id,
+                    tool_name=tool_name_map.get(tool_id, ""),
+                    content=block.get("content"),
+                    is_error=block.get("is_error") is True,
+                    cache_control="cache_control" in block,
+                ):
+                    allowed_blocks.add((message_idx, block_idx))
+        return allowed_messages, allowed_blocks
+
+    @staticmethod
+    def _strict_scope_preserved(
+        original: list[dict[str, Any]],
+        transformed: list[dict[str, Any]],
+        allowed_messages: set[int],
+        allowed_blocks: set[tuple[int, int]],
+    ) -> bool:
+        """Postcondition: only eligible tool-result content fields may differ."""
+        if len(original) != len(transformed):
+            return False
+        for message_idx, (before, after) in enumerate(zip(original, transformed)):
+            before_meta = {key: value for key, value in before.items() if key != "content"}
+            after_meta = {key: value for key, value in after.items() if key != "content"}
+            if before_meta != after_meta:
+                return False
+            if message_idx in allowed_messages:
+                continue
+            before_content = before.get("content")
+            after_content = after.get("content")
+            if not isinstance(before_content, list) or not isinstance(after_content, list):
+                if before_content != after_content:
+                    return False
+                continue
+            if len(before_content) != len(after_content):
+                return False
+            for block_idx, (before_block, after_block) in enumerate(
+                zip(before_content, after_content)
+            ):
+                if (message_idx, block_idx) not in allowed_blocks:
+                    if before_block != after_block:
+                        return False
+                    continue
+                if not isinstance(before_block, dict) or not isinstance(after_block, dict):
+                    return False
+                if {key: value for key, value in before_block.items() if key != "content"} != {
+                    key: value for key, value in after_block.items() if key != "content"
+                }:
+                    return False
+        return True
+
     def _net_cost_allows(
         self,
         *,
@@ -3299,7 +3523,10 @@ class ContentRouter(Transform):
             TransformResult with routed and compressed messages.
         """
         # Pre-process: Read lifecycle management (stale/superseded detection)
-        if self.config.read_lifecycle.enabled:
+        # Strict scope protects Read output as high-value tool ground truth.
+        # ReadLifecycle replaces content with CCR markers before normal routing,
+        # so disable that pre-pass here or it could bypass the shared scope gate.
+        if self.config.read_lifecycle.enabled and not self.config.lossy_tool_results_only:
             from .read_lifecycle import ReadLifecycleManager
 
             # is None (not truthiness) so falsy test doubles are honored;
@@ -3423,6 +3650,14 @@ class ContentRouter(Transform):
                 if _cmd and _is_read_command(_cmd):
                     self._protect_read_msg_indices.add(_idx)
 
+        frozen_message_count = kwargs.get("frozen_message_count", 0)
+        strict_allowed_messages, strict_allowed_blocks = self._strict_lossy_locations(
+            messages,
+            tool_name_map,
+            excluded_tool_ids,
+            frozen_message_count,
+        )
+
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
         model_limit = kwargs.get("model_limit", 0)
@@ -3491,8 +3726,6 @@ class ContentRouter(Transform):
         analysis_intent = False
         if self.config.protect_analysis_context:
             analysis_intent = self._detect_analysis_intent(messages)
-
-        frozen_message_count = kwargs.get("frozen_message_count", 0)
 
         # ------------------------------------------------------------------
         # Two-pass parallel compression.
@@ -3601,6 +3834,11 @@ class ContentRouter(Transform):
                     skip_user=skip_user,
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
+                    strict_allowed_tool_result_blocks={
+                        block_idx
+                        for message_idx, block_idx in strict_allowed_blocks
+                        if message_idx == i
+                    },
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -3610,6 +3848,15 @@ class ContentRouter(Transform):
             if not isinstance(content, str):
                 result_slots[i] = message
                 route_counts["non_string"] += 1
+                continue
+
+            # In strict mode every non-eligible message is immutable. This gate
+            # comes before Read experimentation, type routing, and Kompress so no
+            # strategy flag can widen the scope accidentally.
+            if self.config.lossy_tool_results_only and i not in strict_allowed_messages:
+                result_slots[i] = message
+                route_counts.setdefault("strict_scope_protected", 0)
+                route_counts["strict_scope_protected"] += 1
                 continue
 
             # Skip OpenAI-style tool messages for excluded tools
@@ -3776,7 +4023,7 @@ class ContentRouter(Transform):
             # Tool ground truth is gated against lossy-unrecoverable results below
             # (#1307). Partition its cache namespace so a gated tool entry is never
             # served from — or poisons — an ungated entry for byte-identical content.
-            enforce_reversibility = role == "tool"
+            enforce_reversibility = role in {"tool", "function"}
             if enforce_reversibility:
                 content_key = hash((content_key, True))
 
@@ -3960,10 +4207,26 @@ class ContentRouter(Transform):
         # later duplicate would carry the same (recoverable) form anyway; dedup
         # just points to the earlier copy instead of repeating it. Frozen +
         # cache_control blocks are reference targets only (never rewritten).
-        if self._cross_turn_dedup_enabled:
+        if self._cross_turn_dedup_enabled and not self.config.lossy_tool_results_only:
             transformed_messages = self._cross_turn_dedup_messages(
                 transformed_messages, frozen_message_count, transforms_applied, route_counts
             )
+
+        if self.config.lossy_tool_results_only and not self._strict_scope_preserved(
+            messages,
+            transformed_messages,
+            strict_allowed_messages,
+            strict_allowed_blocks,
+        ):
+            logger.error(
+                "content_router strict lossy scope rejected an out-of-bound mutation; "
+                "returning original messages"
+            )
+            transformed_messages = messages
+            transforms_applied = ["router:strict_scope_rejected"]
+            compressed_details = []
+            route_counts.setdefault("strict_scope_rejected", 0)
+            route_counts["strict_scope_rejected"] += 1
 
         tokens_after = sum(
             tokenizer.count_text(str(m.get("content", ""))) for m in transformed_messages
@@ -4310,6 +4573,7 @@ class ContentRouter(Transform):
         skip_user: bool = True,
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
+        strict_allowed_tool_result_blocks: set[int] | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -4371,7 +4635,7 @@ class ContentRouter(Transform):
         else:
             protect_text_blocks = True
 
-        for block in content_blocks:
+        for block_idx, block in enumerate(content_blocks):
             if not isinstance(block, dict):
                 new_blocks.append(block)
                 continue
@@ -4391,6 +4655,14 @@ class ContentRouter(Transform):
 
             # Handle tool_result blocks
             if block_type == "tool_result":
+                if self.config.lossy_tool_results_only and block_idx not in (
+                    strict_allowed_tool_result_blocks or set()
+                ):
+                    new_blocks.append(block)
+                    if route_counts is not None:
+                        route_counts.setdefault("strict_scope_protected", 0)
+                        route_counts["strict_scope_protected"] += 1
+                    continue
                 # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
                 # Flatten OpenAI-style list-form content up front (see fix-7 note below)
@@ -4591,7 +4863,11 @@ class ContentRouter(Transform):
             # block-list form. Roles are gated above (user/system always
             # skipped; assistant default-skipped, opt-in via
             # `compress_assistant_text_blocks`).
-            elif block_type == "text" and not protect_text_blocks:
+            elif (
+                block_type == "text"
+                and not self.config.lossy_tool_results_only
+                and not protect_text_blocks
+            ):
                 text_content = block.get("text", "")
                 if isinstance(text_content, str) and (
                     len(text_content) > min_chars or self._has_lossless_fold(text_content)

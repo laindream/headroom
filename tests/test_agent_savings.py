@@ -73,8 +73,8 @@ def test_coding_persona_protects_working_set_and_stays_visible() -> None:
     assert env["HEADROOM_MODE"] == "cache"  # delta-only compression at ~0 prefix-cache busts
     assert env["HEADROOM_PROTECT_RECENT"] == "2"  # keep the active code working set verbatim
     assert env["HEADROOM_MIN_TOKENS"] == "25"  # low → compression is actually visible
-    # Cache mode compresses the newest observation delta → compress_user must be ON.
-    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
+    # Structured tool_result blocks remain independently eligible; user prose is exact.
+    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "0"
     assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"  # system prompt is the hottest cache
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
     assert "HEADROOM_TARGET_RATIO" not in env  # unset → Kompress / ambient default decides
@@ -87,6 +87,9 @@ def test_coding_persona_protects_working_set_and_stays_visible() -> None:
     assert env["HEADROOM_EFFORT_ROUTER"] == "0"
     assert env["HEADROOM_LOSSLESS"] == "0"  # lossy enabled (CCR keeps it recoverable)
     assert env["HEADROOM_MIN_CHARS_FOR_BLOCK"] == "25"
+    assert env["HEADROOM_LOSSY_TOOL_RESULTS_ONLY"] == "1"
+    assert env["HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS"] == "2"
+    assert env["HEADROOM_LOSSY_TOOL_ALLOWLIST"] == "Bash"
 
 
 def test_general_persona_has_no_positional_code_protection() -> None:
@@ -100,10 +103,10 @@ def test_general_persona_has_no_positional_code_protection() -> None:
 
 
 def test_personas_omit_target_ratio_in_pipeline_kwargs() -> None:
-    # coding compresses the delta observation (cache mode) → compress_user True;
-    # general has no positional code working set and leaves user turns intact.
+    # Both personas leave real user turns intact. Anthropic tool_result blocks
+    # remain independently eligible in coding mode.
     for name, expected_protect, expected_compress_user in (
-        ("coding", 2, True),
+        ("coding", 2, False),
         ("general", 0, False),
     ):
         kwargs = proxy_pipeline_kwargs(ProxyConfig(savings_profile=name))

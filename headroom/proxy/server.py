@@ -701,11 +701,31 @@ class HeadroomProxy(
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
         profile_kwargs = proxy_pipeline_kwargs(config)
+        strict_lossy_scope = bool(
+            config.lossy_tool_results_only or profile_kwargs.get("lossy_tool_results_only", False)
+        )
+        if strict_lossy_scope and not config.lossy_tool_allowlist:
+            config.lossy_tool_allowlist = cast(
+                frozenset[str],
+                profile_kwargs.get("lossy_tool_allowlist", frozenset()),
+            )
+        if config.protect_recent_tool_result_turns == 2:
+            config.protect_recent_tool_result_turns = int(
+                profile_kwargs.get("protect_recent_tool_result_turns", 2)
+            )
+        # Handlers also run post-router ReadMaturation. Persist the resolved
+        # value on their shared config instead of keeping it router-local.
+        config.lossy_tool_results_only = strict_lossy_scope
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
             prefer_code_aware_for_code=_get_env_bool("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", True),
             tool_profiles=config.tool_profiles,
-            read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
+            read_lifecycle=ReadLifecycleConfig(
+                enabled=config.read_lifecycle and not strict_lossy_scope
+            ),
+            lossy_tool_results_only=strict_lossy_scope,
+            protect_recent_tool_result_turns=config.protect_recent_tool_result_turns,
+            lossy_tool_allowlist=config.lossy_tool_allowlist,
             smart_crusher_max_items_after_crush=cast(
                 int | None,
                 profile_kwargs.get("max_items_after_crush"),
@@ -4419,6 +4439,13 @@ def _proxy_config_from_env() -> ProxyConfig:
         cache_pressure_count_timeout_seconds=_get_env_float(
             "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
         ),
+        lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
+        protect_recent_tool_result_turns=_get_env_int(
+            "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS", 2
+        ),
+        lossy_tool_allowlist=frozenset(
+            _parse_csv_tools(os.environ.get("HEADROOM_LOSSY_TOOL_ALLOWLIST"))
+        ),
         # Default savings profile is "coding" so proxy_pipeline_kwargs applies its
         # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
         # overrides.
@@ -5105,6 +5132,13 @@ if __name__ == "__main__":
         ),
         cache_pressure_count_timeout_seconds=_get_env_float(
             "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
+        ),
+        lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
+        protect_recent_tool_result_turns=_get_env_int(
+            "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS", 2
+        ),
+        lossy_tool_allowlist=frozenset(
+            _parse_csv_tools(os.environ.get("HEADROOM_LOSSY_TOOL_ALLOWLIST"))
         ),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
