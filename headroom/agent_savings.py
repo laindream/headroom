@@ -166,7 +166,7 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         # text-only harness observations trade compression for the same safety.
         compress_user_messages=False,
         compress_system_messages=False,  # system prompt is the hottest cache
-        protect_recent=2,  # keep the active code working set verbatim
+        protect_recent=0,  # tool observations are classified by content, not position
         protect_analysis_context=True,
         min_tokens_to_compress=25,  # low → compression is visible
         max_items_after_crush=15,
@@ -187,9 +187,9 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         effort_router=False,
         lossless=False,
         min_chars_for_block=25,
-        lossy_tool_results_only=True,
-        protect_recent_tool_result_turns=2,
-        lossy_tool_allowlist=("Bash",),
+        lossy_tool_results_only=False,
+        protect_recent_tool_result_turns=0,
+        lossy_tool_allowlist=(),
     ),
     "general": AgentSavingsProfile(
         name="general",

@@ -19,6 +19,11 @@ from headroom.proxy.server import (
 )
 
 
+class _Tokenizer:
+    def count_text(self, text: str) -> int:
+        return max(1, len(str(text)) // 4)
+
+
 def _build(**overrides: object) -> HeadroomProxy:
     config = ProxyConfig(
         optimize=False,
@@ -57,6 +62,7 @@ def test_protect_tool_results_merges_into_exclude_set() -> None:
         "lowercase bash must be in exclude_tools after protect_tool_results merges"
     )
     assert "Read" in exclude, "Read (built-in default) must still be in exclude_tools"
+    assert _router(proxy).config.protect_tool_results == frozenset({"Bash", "bash"})
 
 
 def test_protect_tool_results_disables_age_decay_in_token_mode() -> None:
@@ -151,3 +157,91 @@ def test_bash_not_in_default_exclude_tools() -> None:
     is the opt-in path."""
     assert "Bash" not in DEFAULT_EXCLUDE_TOOLS
     assert "bash" not in DEFAULT_EXCLUDE_TOOLS
+
+
+def test_protect_tool_results_is_verbatim_even_outside_recent_window() -> None:
+    """Control-plane tool results stay byte-identical regardless of age."""
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    router = ContentRouter(
+        ContentRouterConfig(
+            min_chars_for_block_compression=10,
+            protect_tool_results=frozenset({"Agent"}),
+        )
+    )
+    calls: list[str] = []
+
+    def fake_compress_block_content(**kwargs: object) -> tuple[str, bool]:
+        calls.append(str(kwargs["strategy_label"]))
+        return "COMPRESSED", True
+
+    router._compress_block_content = fake_compress_block_content  # type: ignore[method-assign]
+    output = "delegated decision and review conclusion " * 80
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "agent-1", "name": "Agent", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "agent-1", "content": output}],
+        },
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    result = router.apply(
+        messages,
+        _Tokenizer(),
+        read_protection_window=0,
+        min_chars_for_block_compression=10,
+    )
+
+    assert result.messages[1]["content"][0]["content"] == output
+    assert calls == []
+
+
+def test_unprotected_mcp_observation_remains_content_routable() -> None:
+    """Unknown/MCP observations are recoverable data, not control-plane prose."""
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    router = ContentRouter(
+        ContentRouterConfig(
+            min_chars_for_block_compression=10,
+            protect_tool_results=frozenset({"Agent", "Task"}),
+        )
+    )
+    calls: list[str] = []
+
+    def fake_compress_block_content(**kwargs: object) -> tuple[str, bool]:
+        calls.append(str(kwargs["strategy_label"]))
+        return "COMPRESSED <<ccr:deadbeef>>", True
+
+    router._compress_block_content = fake_compress_block_content  # type: ignore[method-assign]
+    output = "search result observation row with redundant metadata " * 80
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "mcp-1",
+                    "name": "mcp__semble__search",
+                    "input": {},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "mcp-1", "content": output}],
+        },
+    ]
+
+    result = router.apply(
+        messages,
+        _Tokenizer(),
+        min_chars_for_block_compression=10,
+    )
+
+    assert result.messages[1]["content"][0]["content"] == "COMPRESSED <<ccr:deadbeef>>"
+    assert calls == ["tool_result"]

@@ -1131,6 +1131,11 @@ class ContentRouterConfig:
     protect_recent_tool_result_turns: int = 2
     lossy_tool_allowlist: frozenset[str] = field(default_factory=frozenset)
 
+    # Control-plane tools whose results must stay byte-identical at every age.
+    # Unlike exclude_tools this forbids lossless folds too: delegated decisions,
+    # plans, permissions, and task state are not observation data.
+    protect_tool_results: frozenset[str] = field(default_factory=frozenset)
+
     # Minimum content length (in chars) at which a text or tool_result
     # block is considered for compression. Below this, the overhead of
     # routing/detecting/caching exceeds any savings, so the block is
@@ -3859,6 +3864,22 @@ class ContentRouter(Transform):
                 route_counts["strict_scope_protected"] += 1
                 continue
 
+            # Explicit control-plane protection is positional- and
+            # strategy-independent.  It runs before excluded-tool lossless
+            # folding and before every lossy route.
+            if role in {"tool", "function"}:
+                protected_tool_call_id = str(
+                    message.get("tool_call_id") or message.get("tool_use_id") or ""
+                )
+                protected_tool_name = tool_name_map.get(protected_tool_call_id) or str(
+                    message.get("name") or ""
+                )
+                if is_tool_excluded(protected_tool_name, self.config.protect_tool_results):
+                    result_slots[i] = message
+                    route_counts.setdefault("protected_tool_result", 0)
+                    route_counts["protected_tool_result"] += 1
+                    continue
+
             # Skip OpenAI-style tool messages for excluded tools
             # BUT: allow compression of old excluded-tool outputs beyond the
             # adaptive protection window (age-based decay).
@@ -4665,6 +4686,13 @@ class ContentRouter(Transform):
                     continue
                 # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
+                tool_name = (tool_name_map or {}).get(tool_use_id, "")
+                if is_tool_excluded(tool_name, self.config.protect_tool_results):
+                    new_blocks.append(block)
+                    if route_counts is not None:
+                        route_counts.setdefault("protected_tool_result", 0)
+                        route_counts["protected_tool_result"] += 1
+                    continue
                 # Flatten OpenAI-style list-form content up front (see fix-7 note below)
                 # so both the read-protection content check and the compressor see the
                 # same text.
@@ -4726,7 +4754,6 @@ class ContentRouter(Transform):
                     # Old excluded-tool output — fall through to compression
 
                 # Look up tool-specific compression bias
-                tool_name = (tool_name_map or {}).get(tool_use_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
                 # Enrich the relevance query with the triggering tool call's

@@ -1701,59 +1701,66 @@ class AnthropicHandlerMixin:
                         pressure_messages = normalize_message_cache_control(
                             pressure_result.messages
                         )
-                        precomputed_rescue_baseline = copy.deepcopy(optimized_messages)
-                        precomputed_rescue_messages = copy.deepcopy(pressure_messages)
-                        precomputed_rescue_result = pressure_result
-                        candidate_body = {**body, "messages": pressure_messages}
-                        candidate_tokens = await self._count_anthropic_request_tokens(
-                            candidate_body,
-                            headers,
-                        )
-                        if candidate_tokens is not None:
-                            tags["cache_pressure_candidate_tokens"] = candidate_tokens
-                            tags["cache_pressure_candidate_ratio"] = round(
-                                candidate_tokens / baseline_tokens,
-                                6,
-                            )
-                            candidate_meets_reduction = should_accept_cache_pressure_candidate(
-                                baseline_tokens,
-                                candidate_tokens,
-                                self.config.cache_pressure_max_output_ratio,
-                            )
-                        if candidate_tokens is None:
-                            tags["cache_pressure_decision"] = "candidate_count_unavailable"
-                        elif candidate_meets_reduction:
-                            optimized_messages = pressure_messages
-                            original_tokens = baseline_tokens
-                            optimized_tokens = candidate_tokens
-                            transforms_applied = list(pressure_result.transforms_applied) + [
-                                "cache_pressure:prefix_break"
-                            ]
-                            pipeline_timing = pressure_result.timing
-                            if pressure_result.waste_signals:
-                                waste_signals_dict = pressure_result.waste_signals.to_dict()
-                            frozen_message_count = 0
-                            tags["cache_pressure_decision"] = "accepted"
-                            body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
-                            logger.info(
-                                "[%s] Cache pressure: accepted prefix rewrite "
-                                "(%s -> %s tokens, pressure=%s/%s)",
-                                request_id,
-                                baseline_tokens,
-                                candidate_tokens,
-                                pressure_tokens,
-                                trigger_threshold_tokens,
-                            )
+                        # Compare with the full-history token-mode input, not
+                        # the cache overlay.  The overlay may already contain
+                        # older accepted compression; replacing it with raw
+                        # history is still a no-op candidate from this run.
+                        if pressure_messages == normalize_message_cache_control(messages):
+                            tags["cache_pressure_decision"] = "candidate_unchanged"
                         else:
-                            tags["cache_pressure_decision"] = "insufficient_reduction"
-                            logger.info(
-                                "[%s] Cache pressure: rejected prefix rewrite "
-                                "(%s -> %s tokens, max_output_ratio=%.3f)",
-                                request_id,
-                                baseline_tokens,
-                                candidate_tokens,
-                                self.config.cache_pressure_max_output_ratio,
+                            precomputed_rescue_baseline = copy.deepcopy(optimized_messages)
+                            precomputed_rescue_messages = copy.deepcopy(pressure_messages)
+                            precomputed_rescue_result = pressure_result
+                            candidate_body = {**body, "messages": pressure_messages}
+                            candidate_tokens = await self._count_anthropic_request_tokens(
+                                candidate_body,
+                                headers,
                             )
+                            if candidate_tokens is not None:
+                                tags["cache_pressure_candidate_tokens"] = candidate_tokens
+                                tags["cache_pressure_candidate_ratio"] = round(
+                                    candidate_tokens / baseline_tokens,
+                                    6,
+                                )
+                                candidate_meets_reduction = should_accept_cache_pressure_candidate(
+                                    baseline_tokens,
+                                    candidate_tokens,
+                                    self.config.cache_pressure_max_output_ratio,
+                                )
+                            if candidate_tokens is None:
+                                tags["cache_pressure_decision"] = "candidate_count_unavailable"
+                            elif candidate_meets_reduction:
+                                optimized_messages = pressure_messages
+                                original_tokens = baseline_tokens
+                                optimized_tokens = candidate_tokens
+                                transforms_applied = list(pressure_result.transforms_applied) + [
+                                    "cache_pressure:prefix_break"
+                                ]
+                                pipeline_timing = pressure_result.timing
+                                if pressure_result.waste_signals:
+                                    waste_signals_dict = pressure_result.waste_signals.to_dict()
+                                frozen_message_count = 0
+                                tags["cache_pressure_decision"] = "accepted"
+                                body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
+                                logger.info(
+                                    "[%s] Cache pressure: accepted prefix rewrite "
+                                    "(%s -> %s tokens, pressure=%s/%s)",
+                                    request_id,
+                                    baseline_tokens,
+                                    candidate_tokens,
+                                    pressure_tokens,
+                                    trigger_threshold_tokens,
+                                )
+                            else:
+                                tags["cache_pressure_decision"] = "insufficient_reduction"
+                                logger.info(
+                                    "[%s] Cache pressure: rejected prefix rewrite "
+                                    "(%s -> %s tokens, max_output_ratio=%.3f)",
+                                    request_id,
+                                    baseline_tokens,
+                                    candidate_tokens,
+                                    self.config.cache_pressure_max_output_ratio,
+                                )
                     except Exception as exc:
                         if exact_threshold_met:
                             tags["cache_pressure_decision"] = "candidate_failed"

@@ -567,6 +567,70 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         assert tags["cache_pressure_target_ratio"] == 0.12
 
 
+def test_cache_pressure_unchanged_candidate_skips_second_exact_count() -> None:
+    """A byte-identical candidate cannot satisfy the reduction gate."""
+    config = ProxyConfig(
+        mode="cache",
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        image_optimize=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        cache_pressure_token_mode_enabled=True,
+        cache_pressure_trigger_ratio=0.85,
+        cache_pressure_target_ratio=0.12,
+        cache_pressure_max_output_ratio=0.80,
+    )
+    app = create_app(config)
+    captured: dict[str, object] = {}
+    captured_logs: list[object] = []
+    tracker = _Tracker()
+    tracker._last_response_total_tokens = 310_000
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *_args, **_kwargs: "unchanged-pressure-session",
+            get_or_create=lambda *_args, **_kwargs: tracker,
+        )
+        proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
+        count_tokens = AsyncMock(return_value=350_000)
+        proxy._count_anthropic_request_tokens = count_tokens
+        proxy.logger = SimpleNamespace(log=captured_logs.append)
+
+        def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
+            return _result(kwargs["messages"])
+
+        proxy.anthropic_pipeline.apply = apply_pipeline
+
+        async def fake_retry(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN202
+            captured["body"] = body
+            return _upstream_success()
+
+        proxy._retry_request = fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "messages": tracker.previous_original
+                + [{"role": "user", "content": "new live turn"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert count_tokens.await_count == 1
+    assert captured["body"]["messages"][0]["content"] == "cached forwarded request"
+    tags = captured_logs[0].tags
+    assert tags["cache_pressure_decision"] == "candidate_unchanged"
+    assert "cache_pressure_candidate_tokens" not in tags
+
+
 _CONTEXT_OVERFLOW_MESSAGE = (
     "Your input exceeds the context window of this model. "
     "Please adjust your input and try again."

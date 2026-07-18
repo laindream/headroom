@@ -71,7 +71,7 @@ def test_coding_persona_protects_working_set_and_stays_visible() -> None:
 
     assert env["HEADROOM_SAVINGS_PROFILE"] == "coding"
     assert env["HEADROOM_MODE"] == "cache"  # delta-only compression at ~0 prefix-cache busts
-    assert env["HEADROOM_PROTECT_RECENT"] == "2"  # keep the active code working set verbatim
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"  # route observations by content, not position
     assert env["HEADROOM_MIN_TOKENS"] == "25"  # low → compression is actually visible
     # Structured tool_result blocks remain independently eligible; user prose is exact.
     assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "0"
@@ -87,9 +87,9 @@ def test_coding_persona_protects_working_set_and_stays_visible() -> None:
     assert env["HEADROOM_EFFORT_ROUTER"] == "0"
     assert env["HEADROOM_LOSSLESS"] == "0"  # lossy enabled (CCR keeps it recoverable)
     assert env["HEADROOM_MIN_CHARS_FOR_BLOCK"] == "25"
-    assert env["HEADROOM_LOSSY_TOOL_RESULTS_ONLY"] == "1"
-    assert env["HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS"] == "2"
-    assert env["HEADROOM_LOSSY_TOOL_ALLOWLIST"] == "Bash"
+    assert "HEADROOM_LOSSY_TOOL_RESULTS_ONLY" not in env
+    assert "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS" not in env
+    assert "HEADROOM_LOSSY_TOOL_ALLOWLIST" not in env
 
 
 def test_general_persona_has_no_positional_code_protection() -> None:
@@ -106,7 +106,7 @@ def test_personas_omit_target_ratio_in_pipeline_kwargs() -> None:
     # Both personas leave real user turns intact. Anthropic tool_result blocks
     # remain independently eligible in coding mode.
     for name, expected_protect, expected_compress_user in (
-        ("coding", 2, False),
+        ("coding", 0, False),
         ("general", 0, False),
     ):
         kwargs = proxy_pipeline_kwargs(ProxyConfig(savings_profile=name))
@@ -125,7 +125,7 @@ def test_persona_apply_profile_leaves_target_ratio_untouched() -> None:
 
     apply_agent_savings_profile(cfg, "coding")
 
-    assert cfg.protect_recent == 2
+    assert cfg.protect_recent == 0
     assert cfg.min_tokens_to_compress == 25
     assert cfg.target_ratio == 0.42  # persona did not override an explicit ratio
 

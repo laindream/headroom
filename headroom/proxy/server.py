@@ -726,6 +726,7 @@ class HeadroomProxy(
             lossy_tool_results_only=strict_lossy_scope,
             protect_recent_tool_result_turns=config.protect_recent_tool_result_turns,
             lossy_tool_allowlist=config.lossy_tool_allowlist,
+            protect_tool_results=config.protect_tool_results,
             smart_crusher_max_items_after_crush=cast(
                 int | None,
                 profile_kwargs.get("max_items_after_crush"),

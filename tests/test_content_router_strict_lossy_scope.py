@@ -217,7 +217,7 @@ def test_proxy_wires_strict_scope_and_disables_pre_router_read_replacement() -> 
     assert router.config.read_lifecycle.enabled is False
 
 
-def test_coding_profile_enables_strict_scope_without_wrapper_env() -> None:
+def test_coding_profile_routes_observations_without_strict_tool_allowlist() -> None:
     proxy = HeadroomProxy(
         ProxyConfig(
             optimize=False,
@@ -230,6 +230,6 @@ def test_coding_profile_enables_strict_scope_without_wrapper_env() -> None:
     )
     router = proxy.anthropic_pipeline.transforms[-1]
 
-    assert router.config.lossy_tool_results_only is True
-    assert router.config.lossy_tool_allowlist == frozenset({"Bash"})
-    assert router.config.read_lifecycle.enabled is False
+    assert router.config.lossy_tool_results_only is False
+    assert router.config.lossy_tool_allowlist == frozenset()
+    assert router.config.read_lifecycle.enabled is True
