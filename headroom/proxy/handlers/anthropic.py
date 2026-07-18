@@ -1264,19 +1264,29 @@ class AnthropicHandlerMixin:
                     from headroom.transforms.compression_policy import resolve_policy
 
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+                    from headroom.mcp_tool_names import is_headroom_mcp_tool_name
+
+                    existing_tool_names = {
+                        tool.get("name") or tool.get("function", {}).get("name")
+                        for tool in (body.get("tools") or [])
+                        if isinstance(tool, dict)
+                    }
+                    has_existing_ccr_retrieve_tool = any(
+                        is_headroom_mcp_tool_name(name, CCR_TOOL_NAME)
+                        for name in existing_tool_names
+                    )
 
                     def should_skip_ccr_request_compression(
                         current_frozen_message_count: int,
                     ) -> bool:
                         if is_token_mode(self.config.mode):
                             return False
-                        # Tool availability is captured once from the inbound
-                        # request, before pipeline extensions can rewrite the
-                        # body. Keep that decision stable for this request.
+                        # If the tool is already present, CCR stays reversible even on frozen turns.
                         return (
                             self.config.ccr_inject_tool
                             and current_frozen_message_count > 0
-                            and not client_has_ccr_retrieve_tool
+                            and not has_existing_ccr_retrieve_tool
                         )
 
                     if is_token_mode(self.config.mode):
