@@ -618,6 +618,11 @@ _RELEASABLE_READ_TYPES = frozenset(
     }
 )
 
+# Native file-read tools do not carry a shell command for _is_read_command().
+# Mark their result IDs explicitly so they share the same content-aware guard:
+# source/plain text stays exact; confidently structured data remains routable.
+_DIRECT_FILE_READ_TOOLS = frozenset({"Read", "read_file"})
+
 
 def _read_output_should_be_protected(text: Any) -> bool:
     """Finalize read-protection by CONTENT — protect by default, release only DATA.
@@ -3622,8 +3627,9 @@ class ContentRouter(Transform):
             # extracted via _tool_call_command_text, correct for both wire shapes.
             self._protect_read_tool_ids = {
                 tid
-                for tid in tool_name_map
+                for tid, tool_name in tool_name_map.items()
                 if _is_read_command(self._tool_call_commands.get(tid, ""))
+                or is_tool_excluded(tool_name, _DIRECT_FILE_READ_TOOLS)
             }
 
         # Read protection — TEXT-BASED shape (shape-agnostic twin of the above).

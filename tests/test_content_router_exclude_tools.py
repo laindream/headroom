@@ -245,3 +245,121 @@ def test_unprotected_mcp_observation_remains_content_routable() -> None:
 
     assert result.messages[1]["content"][0]["content"] == "COMPRESSED <<ccr:deadbeef>>"
     assert calls == ["tool_result"]
+
+
+def test_direct_read_source_is_exact_without_blanket_tool_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's native Read must use the same content-aware guard as shell reads."""
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    from headroom.transforms.read_lifecycle import ReadLifecycleConfig
+
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    router = ContentRouter(
+        ContentRouterConfig(
+            min_chars_for_block_compression=10,
+            protect_tool_results=frozenset(),
+            read_lifecycle=ReadLifecycleConfig(enabled=False),
+        )
+    )
+    calls: list[str] = []
+
+    def fake_compress_block_content(**kwargs: object) -> tuple[str, bool]:
+        calls.append(str(kwargs["strategy_label"]))
+        return "COMPRESSED", True
+
+    router._compress_block_content = fake_compress_block_content  # type: ignore[method-assign]
+    source = "def update_item(value):\n    return value + 1\n" * 80
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "read-source",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/app.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "read-source",
+                    "content": source,
+                }
+            ],
+        },
+        {"role": "assistant", "content": "continue"},
+        {"role": "user", "content": "next step"},
+    ]
+
+    result = router.apply(
+        messages,
+        _Tokenizer(),
+        read_protection_window=0,
+        min_chars_for_block_compression=10,
+    )
+
+    assert result.messages[1]["content"][0]["content"] == source
+    assert calls == []
+
+
+def test_direct_read_data_is_routable_without_blanket_tool_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native Read JSON/log observations remain eligible for reversible compression."""
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    from headroom.transforms.read_lifecycle import ReadLifecycleConfig
+
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    router = ContentRouter(
+        ContentRouterConfig(
+            min_chars_for_block_compression=10,
+            protect_tool_results=frozenset(),
+            read_lifecycle=ReadLifecycleConfig(enabled=False),
+        )
+    )
+    calls: list[str] = []
+
+    def fake_compress_block_content(**kwargs: object) -> tuple[str, bool]:
+        calls.append(str(kwargs["strategy_label"]))
+        return "COMPRESSED <<ccr:deadbeef>>", True
+
+    router._compress_block_content = fake_compress_block_content  # type: ignore[method-assign]
+    data = "[" + ",".join(f'{{"row":{index},"status":"ok"}}' for index in range(80)) + "]"
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "read-data",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/results.json"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "read-data",
+                    "content": data,
+                }
+            ],
+        },
+    ]
+
+    result = router.apply(
+        messages,
+        _Tokenizer(),
+        read_protection_window=0,
+        min_chars_for_block_compression=10,
+    )
+
+    assert result.messages[1]["content"][0]["content"] == "COMPRESSED <<ccr:deadbeef>>"
+    assert calls == ["tool_result"]
