@@ -411,7 +411,7 @@ def test_rejected_candidate_retries_when_read_lifecycle_can_change() -> None:
     )
 
 
-def test_rejected_candidate_retries_when_a_tool_result_matures_old_history() -> None:
+def test_rejected_candidate_retries_for_tool_result_only_with_recent_turn_protection() -> None:
     messages = [
         {"role": "user", "content": "old request"},
         {"role": "assistant", "content": "old answer"},
@@ -434,11 +434,18 @@ def test_rejected_candidate_retries_when_a_tool_result_matures_old_history() -> 
         ],
     }
 
+    assert not should_retry_cache_pressure_candidate(
+        memo,
+        messages + [new_tool_result],
+        pressure_tokens=335_000,
+        max_output_ratio=0.80,
+    )
     assert should_retry_cache_pressure_candidate(
         memo,
         messages + [new_tool_result],
         pressure_tokens=335_000,
         max_output_ratio=0.80,
+        protect_recent_tool_result_turns=2,
     )
 
 
@@ -962,7 +969,18 @@ def test_cache_pressure_reuses_rejection_until_new_savings_are_possible() -> Non
                 "model": "gpt-5.6-sol",
                 "max_tokens": 128,
                 "messages": tracker.previous_original
-                + [{"role": "user", "content": "small next turn"}],
+                + [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tool-next",
+                                "content": "small next observation",
+                            }
+                        ],
+                    }
+                ],
             },
         )
 

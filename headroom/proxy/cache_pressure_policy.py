@@ -80,17 +80,25 @@ def cache_pressure_history_fingerprint(
     return hashlib.sha256(payload).hexdigest()
 
 
-def _contains_candidate_eligibility_change(messages: list[dict[str, Any]]) -> bool:
+def _contains_candidate_eligibility_change(
+    messages: list[dict[str, Any]],
+    *,
+    protect_recent_tool_result_turns: int,
+) -> bool:
     lifecycle_tools = _READ_TOOL_NAMES | _MUTATING_TOOL_NAMES
     for message in messages:
         if not isinstance(message, dict):
             continue
-        if message.get("role") == "tool":
+        if protect_recent_tool_result_turns > 0 and message.get("role") == "tool":
             return True
         content = message.get("content")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
+                if (
+                    protect_recent_tool_result_turns > 0
+                    and isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                ):
                     # Any new tool-result turn can move a previously protected
                     # result beyond the recent-turn boundary, unlocking much
                     # more compression than the appended token count alone.
@@ -119,13 +127,15 @@ def should_retry_cache_pressure_candidate(
     *,
     pressure_tokens: int,
     max_output_ratio: float,
+    protect_recent_tool_result_turns: int = 0,
 ) -> bool:
     """Retry only when a rejected candidate can plausibly cross the gate.
 
-    New context is an upper bound on additional removable tokens. Tool-result
-    turns and read/edit events bypass that bound because they can mature or
-    supersede large historical observations without adding a comparable amount
-    of new text.
+    New context is an upper bound on additional removable tokens. Read/edit
+    events bypass that bound because they can supersede large historical
+    observations without adding comparable text. A tool-result turn bypasses
+    it only when positional recent-turn protection is enabled; the coding
+    profile routes observations by content with a zero-turn window.
     """
 
     if pressure_tokens <= 0 or not 0 < max_output_ratio <= 1:
@@ -139,7 +149,10 @@ def should_retry_cache_pressure_candidate(
         return True
 
     appended = messages[memo.message_count :]
-    if _contains_candidate_eligibility_change(appended):
+    if _contains_candidate_eligibility_change(
+        appended,
+        protect_recent_tool_result_turns=protect_recent_tool_result_turns,
+    ):
         return True
 
     new_context_upper_bound = max(0, pressure_tokens - memo.pressure_tokens)

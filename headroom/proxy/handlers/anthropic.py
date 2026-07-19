@@ -1649,6 +1649,17 @@ class AnthropicHandlerMixin:
                     if hasattr(prefix_tracker, "clear_cache_pressure_rejection"):
                         prefix_tracker.clear_cache_pressure_rejection()
                 else:
+                    pressure_pipeline_kwargs = proxy_pipeline_kwargs(self.config)
+                    pressure_pipeline_kwargs.update(
+                        target_ratio=self.config.cache_pressure_target_ratio,
+                        force_kompress=True,
+                    )
+                    pressure_protect_recent_tool_result_turns = int(
+                        pressure_pipeline_kwargs.get(
+                            "protect_recent_tool_result_turns",
+                            0,
+                        )
+                    )
                     rejection_memo = (
                         prefix_tracker.get_cache_pressure_rejection()
                         if hasattr(prefix_tracker, "get_cache_pressure_rejection")
@@ -1660,6 +1671,9 @@ class AnthropicHandlerMixin:
                             original_client_messages,
                             pressure_tokens=pressure_tokens,
                             max_output_ratio=self.config.cache_pressure_max_output_ratio,
+                            protect_recent_tool_result_turns=(
+                                pressure_protect_recent_tool_result_turns
+                            ),
                         )
                     )
                     if not retry_candidate:
@@ -1692,11 +1706,6 @@ class AnthropicHandlerMixin:
                         from headroom.transforms.compression_policy import resolve_policy
 
                         pressure_policy = resolve_policy(getattr(request.state, "auth_mode", None))
-                        pressure_pipeline_kwargs = proxy_pipeline_kwargs(self.config)
-                        pressure_pipeline_kwargs.update(
-                            target_ratio=self.config.cache_pressure_target_ratio,
-                            force_kompress=True,
-                        )
                         tags["cache_pressure_target_ratio"] = (
                             self.config.cache_pressure_target_ratio
                         )
