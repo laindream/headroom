@@ -199,19 +199,25 @@ async def test_streaming_finalizer_records_original_to_forwarded_prefix_mapping(
         messages=forwarded + [assistant],
         original_messages=original + [assistant],
         response_total_tokens=1_005,
+        response_total_is_lower_bound=False,
         cache_usage_known=True,
     )
 
 
 @pytest.mark.asyncio
-async def test_streaming_finalizer_does_not_anchor_incomplete_anthropic_usage():
-    """Missing cache fields are unknown, not authoritative zeros."""
+async def test_streaming_finalizer_anchors_incomplete_anthropic_usage_as_lower_bound():
+    """Known usage remains useful without pretending omitted cache fields are zero."""
 
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
     tracker = SimpleNamespace(update_from_response=MagicMock())
     state = _stream_state(output_tokens=84)
     state["input_tokens"] = 887
-    state["usage_fields_seen"] = {"input_tokens", "output_tokens"}
+    state["cache_read_input_tokens"] = 329_216
+    state["usage_fields_seen"] = {
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+    }
 
     await proxy._finalize_stream_response(
         body={"messages": [{"role": "user", "content": "large cached request"}]},
@@ -229,7 +235,8 @@ async def test_streaming_finalizer_does_not_anchor_incomplete_anthropic_usage():
     )
 
     tracker_update = tracker.update_from_response.call_args.kwargs
-    assert tracker_update["response_total_tokens"] is None
+    assert tracker_update["response_total_tokens"] == 330_187
+    assert tracker_update["response_total_is_lower_bound"] is True
     assert tracker_update["cache_usage_known"] is False
 
 

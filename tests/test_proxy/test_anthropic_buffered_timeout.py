@@ -11,6 +11,9 @@ from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
 class _FakePrefixTracker:
+    def __init__(self) -> None:
+        self.last_update: dict | None = None
+
     def get_frozen_message_count(self) -> int:
         return 0
 
@@ -21,7 +24,7 @@ class _FakePrefixTracker:
         return []
 
     def update_from_response(self, **kwargs):  # noqa: ANN003
-        return None
+        self.last_update = kwargs
 
 
 class _BufferedPassthroughClient:
@@ -77,10 +80,11 @@ def _make_config() -> ProxyConfig:
     )
 
 
-def _install_prefix_tracker(proxy) -> None:
+def _install_prefix_tracker(proxy) -> _FakePrefixTracker:
     tracker = _FakePrefixTracker()
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    return tracker
 
 
 def _anthropic_message_response() -> dict[str, object]:
@@ -142,6 +146,46 @@ def test_anthropic_messages_buffered_timeout_override_reaches_retry_request():
 
     assert "timeout" in captured, response.text
     assert isinstance(captured["timeout"], httpx.Timeout)
+
+
+def test_anthropic_nonstreaming_incomplete_usage_is_a_lower_bound() -> None:
+    config = _make_config()
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        tracker = _install_prefix_tracker(proxy)
+        tracker._cached_token_count = 0
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            response = _anthropic_message_response()
+            response["usage"] = {
+                "input_tokens": 887,
+                "output_tokens": 84,
+                "cache_read_input_tokens": 329_216,
+            }
+            return httpx.Response(200, json=response)
+
+        proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert tracker.last_update is not None
+    assert tracker.last_update["response_total_tokens"] == 330_187
+    assert tracker.last_update["response_total_is_lower_bound"] is True
+    assert tracker.last_update["cache_usage_known"] is False
 
 
 def test_anthropic_batch_create_buffered_timeout_override_reaches_retry_request():

@@ -1618,11 +1618,17 @@ class AnthropicHandlerMixin:
                     if hasattr(prefix_tracker, "get_last_response_total_tokens")
                     else None
                 )
+                latest_response_total_is_lower_bound = (
+                    prefix_tracker.get_last_response_total_is_lower_bound()
+                    if hasattr(prefix_tracker, "get_last_response_total_is_lower_bound")
+                    else False
+                )
                 pressure_estimate = estimate_claude_context(
                     original_client_messages,
                     model=model,
                     previous_messages=prefix_tracker.get_last_original_messages(),
                     latest_response_total_tokens=latest_response_total_tokens,
+                    latest_response_total_is_lower_bound=latest_response_total_is_lower_bound,
                 )
                 pressure_tokens = pressure_estimate.tokens
                 effective_context_limit = claude_effective_context_limit(context_limit)
@@ -3547,12 +3553,30 @@ class AnthropicHandlerMixin:
                                 provider_name, miss.reason
                             )
 
+                    response_total_tokens = anthropic_usage_total_tokens(usage)
+                    usage_fields = set(usage)
+                    response_total_is_lower_bound = bool(
+                        response_total_tokens is not None
+                        and not {
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                        }.issubset(usage_fields)
+                    )
+                    cache_usage_known = {
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    }.issubset(usage_fields)
+
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cr_tokens,
                         cache_write_tokens=cw_tokens,
                         messages=next_forwarded_messages,
                         original_messages=next_original_messages,
-                        response_total_tokens=anthropic_usage_total_tokens(usage),
+                        response_total_tokens=response_total_tokens,
+                        response_total_is_lower_bound=response_total_is_lower_bound,
+                        cache_usage_known=cache_usage_known,
                     )
 
                     # Cache response

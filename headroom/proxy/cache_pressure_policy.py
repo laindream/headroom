@@ -267,9 +267,26 @@ def estimate_claude_context(
     model: str,
     previous_messages: list[dict[str, Any]] | None = None,
     latest_response_total_tokens: int | None = None,
+    latest_response_total_is_lower_bound: bool = False,
 ) -> ClaudeContextEstimate:
-    """Mirror Claude Code's response-usage anchor plus estimated tail."""
+    """Mirror Claude Code's response-usage anchor plus estimated tail.
+
+    Incomplete provider usage is a lower bound, not an authoritative zero for
+    omitted fields.  It may raise the local full-history estimate, never lower
+    it.
+    """
     chars_per_token = _claude_chars_per_token(model)
+
+    def full_estimate() -> ClaudeContextEstimate:
+        return ClaudeContextEstimate(
+            tokens=sum(
+                _estimate_claude_content_tokens(message.get("content"), chars_per_token)
+                for message in messages
+                if isinstance(message, dict)
+            ),
+            source="full_estimate",
+        )
+
     can_anchor = (
         isinstance(latest_response_total_tokens, int)
         and not isinstance(latest_response_total_tokens, bool)
@@ -278,6 +295,8 @@ def estimate_claude_context(
         and len(messages) >= len(previous_messages)
     )
     if can_anchor:
+        assert latest_response_total_tokens is not None
+        assert previous_messages is not None
         current_prefix = messages[: len(previous_messages)]
         if _canonicalize_for_prefix_compare(current_prefix) == _canonicalize_for_prefix_compare(
             previous_messages
@@ -291,24 +310,23 @@ def estimate_claude_context(
             source = "full_estimate"
         if source != "full_estimate":
             tail = messages[len(previous_messages) :]
-            return ClaudeContextEstimate(
-                tokens=latest_response_total_tokens
-                + sum(
-                    _estimate_claude_content_tokens(message.get("content"), chars_per_token)
-                    for message in tail
-                    if isinstance(message, dict)
-                ),
-                source=source,
+            anchored_tokens = latest_response_total_tokens + sum(
+                _estimate_claude_content_tokens(message.get("content"), chars_per_token)
+                for message in tail
+                if isinstance(message, dict)
             )
+            if not latest_response_total_is_lower_bound:
+                return ClaudeContextEstimate(tokens=anchored_tokens, source=source)
 
-    return ClaudeContextEstimate(
-        tokens=sum(
-            _estimate_claude_content_tokens(message.get("content"), chars_per_token)
-            for message in messages
-            if isinstance(message, dict)
-        ),
-        source="full_estimate",
-    )
+            estimated = full_estimate()
+            if anchored_tokens > estimated.tokens:
+                return ClaudeContextEstimate(
+                    tokens=anchored_tokens,
+                    source=f"{source}_lower_bound",
+                )
+            return estimated
+
+    return full_estimate()
 
 
 def estimate_claude_context_tokens(
@@ -317,6 +335,7 @@ def estimate_claude_context_tokens(
     model: str,
     previous_messages: list[dict[str, Any]] | None = None,
     latest_response_total_tokens: int | None = None,
+    latest_response_total_is_lower_bound: bool = False,
 ) -> int:
     """Backward-compatible integer wrapper around :func:`estimate_claude_context`."""
 
@@ -325,6 +344,7 @@ def estimate_claude_context_tokens(
         model=model,
         previous_messages=previous_messages,
         latest_response_total_tokens=latest_response_total_tokens,
+        latest_response_total_is_lower_bound=latest_response_total_is_lower_bound,
     ).tokens
 
 

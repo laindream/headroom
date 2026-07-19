@@ -977,6 +977,7 @@ class StreamingMixin:
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
             response_total_tokens = None
+            response_total_is_lower_bound = False
             if provider == "anthropic":
                 required_usage_fields = {
                     "input_tokens",
@@ -984,15 +985,22 @@ class StreamingMixin:
                     "cache_read_input_tokens",
                     "cache_creation_input_tokens",
                 }
-                if usage_fields_seen is None or required_usage_fields.issubset(usage_fields_seen):
-                    response_total_tokens = anthropic_usage_total_tokens(
-                        {
-                            "input_tokens": provider_input_tokens,
-                            "cache_creation_input_tokens": cache_write_tokens,
-                            "cache_read_input_tokens": cache_read_tokens,
-                            "output_tokens": reported_output_tokens,
-                        }
-                    )
+                response_usage: dict[str, Any] = {
+                    "input_tokens": provider_input_tokens,
+                    "output_tokens": reported_output_tokens,
+                }
+                for field, value in (
+                    ("cache_creation_input_tokens", cache_write_tokens),
+                    ("cache_read_input_tokens", cache_read_tokens),
+                ):
+                    if usage_fields_seen is None or field in usage_fields_seen:
+                        response_usage[field] = value
+                response_total_tokens = anthropic_usage_total_tokens(response_usage)
+                response_total_is_lower_bound = bool(
+                    response_total_tokens is not None
+                    and isinstance(usage_fields_seen, set)
+                    and not required_usage_fields.issubset(usage_fields_seen)
+                )
 
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
@@ -1000,6 +1008,7 @@ class StreamingMixin:
                 messages=next_forwarded,
                 original_messages=next_original,
                 response_total_tokens=response_total_tokens,
+                response_total_is_lower_bound=response_total_is_lower_bound,
                 cache_usage_known=cache_usage_known,
             )
 
@@ -1330,10 +1339,7 @@ class StreamingMixin:
             self._cleanup_mid_turn_stream(session_key)
             return StreamingResponse(_error_gen(), media_type="text/event-stream")
 
-        if (
-            upstream_response.status_code >= 400
-            and context_overflow_rescue_builder is not None
-        ):
+        if upstream_response.status_code >= 400 and context_overflow_rescue_builder is not None:
             try:
                 initial_error_content = await upstream_response.aread()
             except Exception:
@@ -1411,9 +1417,7 @@ class StreamingMixin:
                             optimized_tokens = rescue.optimized_tokens
                             tokens_saved = max(0, original_tokens - optimized_tokens)
                             transforms_applied = list(
-                                dict.fromkeys(
-                                    [*transforms_applied, *rescue.transforms_applied]
-                                )
+                                dict.fromkeys([*transforms_applied, *rescue.transforms_applied])
                             )
                             pipeline_timing = {
                                 **(pipeline_timing or {}),
@@ -1423,9 +1427,7 @@ class StreamingMixin:
                                 waste_signals = rescue.waste_signals
                             optimization_latency += rescue.additional_latency_ms
                             tags["cache_pressure_decision"] = "accepted"
-                            tags["cache_pressure_acceptance_reason"] = (
-                                "upstream_context_rescue"
-                            )
+                            tags["cache_pressure_acceptance_reason"] = "upstream_context_rescue"
                             tags["cache_pressure_rescue_outcome"] = "succeeded"
                         else:
                             tags["cache_pressure_rescue_outcome"] = "retry_failed"

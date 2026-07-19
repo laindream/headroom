@@ -116,6 +116,37 @@ def test_claude_context_estimator_uses_latest_api_usage_plus_appended_tail() -> 
     )
 
 
+def test_claude_context_estimator_uses_incomplete_usage_as_a_lower_bound() -> None:
+    previous = [{"role": "user", "content": "short visible history"}]
+    current = previous + [{"role": "user", "content": "x" * 30}]
+
+    estimate = estimate_claude_context(
+        current,
+        model="gpt-5.6-sol",
+        previous_messages=previous,
+        latest_response_total_tokens=330_187,
+        latest_response_total_is_lower_bound=True,
+    )
+
+    assert estimate.tokens == 330_197
+    assert estimate.source == "response_usage_lower_bound"
+
+
+def test_claude_context_estimator_never_uses_a_lower_bound_below_full_estimate() -> None:
+    previous = [{"role": "user", "content": "x" * 3_000}]
+
+    estimate = estimate_claude_context(
+        previous,
+        model="gpt-5.6-sol",
+        previous_messages=previous,
+        latest_response_total_tokens=10,
+        latest_response_total_is_lower_bound=True,
+    )
+
+    assert estimate.tokens == 1_000
+    assert estimate.source == "full_estimate"
+
+
 def test_claude_context_estimator_keeps_usage_anchor_across_thinking_echo_churn() -> None:
     previous = [
         {"role": "user", "content": "old question"},
@@ -231,6 +262,22 @@ def test_prefix_tracker_preserves_latest_response_total_tokens() -> None:
     )
 
     assert tracker.get_last_response_total_tokens() == 330_187
+    assert tracker.get_last_response_total_is_lower_bound() is False
+
+
+def test_prefix_tracker_preserves_incomplete_response_total_as_lower_bound() -> None:
+    tracker = PrefixCacheTracker("anthropic")
+    tracker.update_from_response(
+        cache_read_tokens=329_216,
+        cache_write_tokens=0,
+        messages=[{"role": "assistant", "content": "answer"}],
+        response_total_tokens=330_187,
+        response_total_is_lower_bound=True,
+        cache_usage_known=False,
+    )
+
+    assert tracker.get_last_response_total_tokens() == 330_187
+    assert tracker.get_last_response_total_is_lower_bound() is True
 
 
 def test_streaming_message_delta_preserves_cli_proxy_usage_fields() -> None:

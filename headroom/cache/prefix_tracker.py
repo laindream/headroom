@@ -441,6 +441,7 @@ class PrefixCacheTracker:
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
         self._last_response_total_tokens: int | None = None
+        self._last_response_total_is_lower_bound: bool = False
         self._cache_pressure_rejection: CachePressureRejectionMemo | None = None
         # Idle gap (seconds) since the PREVIOUS turn's response, captured by
         # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
@@ -481,6 +482,7 @@ class PrefixCacheTracker:
         message_token_counts: list[int] | None = None,
         original_messages: list[dict[str, Any]] | None = None,
         response_total_tokens: int | None = None,
+        response_total_is_lower_bound: bool = False,
         cache_usage_known: bool = True,
     ) -> None:
         """Update tracker with cache metrics from the API response.
@@ -494,6 +496,9 @@ class PrefixCacheTracker:
             messages: The messages that were sent to the API.
             message_token_counts: Pre-computed token counts per message.
                 If None, estimates from content length.
+            response_total_tokens: Provider-reported context usage after the response.
+            response_total_is_lower_bound: Whether omitted usage fields make that total
+                a lower bound rather than an exact anchor.
             cache_usage_known: Whether the response explicitly reported cache
                 read/write fields. False updates the turn mapping while
                 preserving the last provider-confirmed frozen prefix.
@@ -508,6 +513,9 @@ class PrefixCacheTracker:
             and not isinstance(response_total_tokens, bool)
             and response_total_tokens > 0
             else None
+        )
+        self._last_response_total_is_lower_bound = bool(
+            self._last_response_total_tokens is not None and response_total_is_lower_bound
         )
 
         if not cache_usage_known:
@@ -564,6 +572,9 @@ class PrefixCacheTracker:
 
     def get_last_response_total_tokens(self) -> int | None:
         return self._last_response_total_tokens
+
+    def get_last_response_total_is_lower_bound(self) -> bool:
+        return self._last_response_total_is_lower_bound
 
     def remember_cache_pressure_rejection(self, memo: CachePressureRejectionMemo) -> None:
         self._cache_pressure_rejection = memo
