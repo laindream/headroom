@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
 from typing import Any
 
-from headroom.cache.prefix_tracker import _canonicalize_for_prefix_compare
+from headroom.cache.prefix_tracker import (
+    CachePressureRejectionMemo,
+    _canonicalize_for_prefix_compare,
+)
+from headroom.config import _MUTATING_TOOL_NAMES, _READ_TOOL_NAMES
 
 CLAUDE_OUTPUT_RESERVE_TOKENS = 20_000
 CLAUDE_COMPACT_HARD_RESERVE_TOKENS = 13_000
@@ -41,6 +46,106 @@ class UpstreamContextRescue:
     pipeline_timing: dict[str, float]
     waste_signals: dict[str, int] | None
     additional_latency_ms: float = 0.0
+
+
+@dataclass(frozen=True)
+class ClaudeContextEstimate:
+    """Claude Code context estimate plus provenance for observability."""
+
+    tokens: int
+    source: str
+
+
+@dataclass(frozen=True)
+class CachePressureCandidateProjection:
+    """Project a count-API delta into Claude Code's context-token space."""
+
+    counted_tokens_saved: int
+    projected_tokens: int
+    projected_ratio: float
+
+
+def cache_pressure_history_fingerprint(
+    messages: list[dict[str, Any]],
+) -> str:
+    """Hash semantic history bytes without retaining prompt content in the memo."""
+
+    canonical = _canonicalize_for_prefix_compare(messages)
+    payload = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _contains_candidate_eligibility_change(messages: list[dict[str, Any]]) -> bool:
+    lifecycle_tools = _READ_TOOL_NAMES | _MUTATING_TOOL_NAMES
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            return True
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    # Any new tool-result turn can move a previously protected
+                    # result beyond the recent-turn boundary, unlocking much
+                    # more compression than the appended token count alone.
+                    return True
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") in lifecycle_tools
+                ):
+                    return True
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or {}
+            if isinstance(function, dict) and function.get("name") in lifecycle_tools:
+                return True
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict) and function_call.get("name") in lifecycle_tools:
+            return True
+    return False
+
+
+def should_retry_cache_pressure_candidate(
+    memo: CachePressureRejectionMemo,
+    messages: list[dict[str, Any]],
+    *,
+    pressure_tokens: int,
+    max_output_ratio: float,
+) -> bool:
+    """Retry only when a rejected candidate can plausibly cross the gate.
+
+    New context is an upper bound on additional removable tokens. Tool-result
+    turns and read/edit events bypass that bound because they can mature or
+    supersede large historical observations without adding a comparable amount
+    of new text.
+    """
+
+    if pressure_tokens <= 0 or not 0 < max_output_ratio <= 1:
+        return True
+    if memo.max_output_ratio != max_output_ratio or len(messages) < memo.message_count:
+        return True
+    if (
+        cache_pressure_history_fingerprint(messages[: memo.message_count])
+        != memo.history_fingerprint
+    ):
+        return True
+
+    appended = messages[memo.message_count :]
+    if _contains_candidate_eligibility_change(appended):
+        return True
+
+    new_context_upper_bound = max(0, pressure_tokens - memo.pressure_tokens)
+    possible_saved_tokens = memo.counted_tokens_saved + new_context_upper_bound
+    required_saved_tokens = math.ceil((1 - max_output_ratio) * pressure_tokens)
+    return possible_saved_tokens >= required_saved_tokens
 
 
 def _claude_chars_per_token(model: str) -> int:
@@ -116,6 +221,83 @@ def _estimate_claude_content_tokens(content: Any, chars_per_token: int) -> int:
     return total
 
 
+def _canonicalize_for_usage_anchor(messages: list[dict[str, Any]]) -> Any:
+    """Normalize assistant reasoning echo churn for token anchoring only.
+
+    Claude Code may echo a prior thinking block as ``redacted_thinking`` or
+    omit it entirely.  That representation change must remain significant for
+    prefix replay, but it does not invalidate the provider-reported token total
+    used as Claude Code's context anchor.  Visible text and tool calls remain
+    exact in this looser, count-only comparison.
+    """
+
+    canonical = _canonicalize_for_prefix_compare(messages)
+    if not isinstance(canonical, list):
+        return canonical
+    for message in canonical:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = [
+                block
+                for block in content
+                if not isinstance(block, dict)
+                or block.get("type") not in {"thinking", "redacted_thinking"}
+            ]
+    return canonical
+
+
+def estimate_claude_context(
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    previous_messages: list[dict[str, Any]] | None = None,
+    latest_response_total_tokens: int | None = None,
+) -> ClaudeContextEstimate:
+    """Mirror Claude Code's response-usage anchor plus estimated tail."""
+    chars_per_token = _claude_chars_per_token(model)
+    can_anchor = (
+        isinstance(latest_response_total_tokens, int)
+        and not isinstance(latest_response_total_tokens, bool)
+        and latest_response_total_tokens > 0
+        and previous_messages
+        and len(messages) >= len(previous_messages)
+    )
+    if can_anchor:
+        current_prefix = messages[: len(previous_messages)]
+        if _canonicalize_for_prefix_compare(current_prefix) == _canonicalize_for_prefix_compare(
+            previous_messages
+        ):
+            source = "response_usage"
+        elif _canonicalize_for_usage_anchor(current_prefix) == _canonicalize_for_usage_anchor(
+            previous_messages
+        ):
+            source = "response_usage_relaxed"
+        else:
+            source = "full_estimate"
+        if source != "full_estimate":
+            tail = messages[len(previous_messages) :]
+            return ClaudeContextEstimate(
+                tokens=latest_response_total_tokens
+                + sum(
+                    _estimate_claude_content_tokens(message.get("content"), chars_per_token)
+                    for message in tail
+                    if isinstance(message, dict)
+                ),
+                source=source,
+            )
+
+    return ClaudeContextEstimate(
+        tokens=sum(
+            _estimate_claude_content_tokens(message.get("content"), chars_per_token)
+            for message in messages
+            if isinstance(message, dict)
+        ),
+        source="full_estimate",
+    )
+
+
 def estimate_claude_context_tokens(
     messages: list[dict[str, Any]],
     *,
@@ -123,31 +305,14 @@ def estimate_claude_context_tokens(
     previous_messages: list[dict[str, Any]] | None = None,
     latest_response_total_tokens: int | None = None,
 ) -> int:
-    """Mirror Claude Code's response-usage anchor plus estimated tail."""
-    chars_per_token = _claude_chars_per_token(model)
-    tail = messages
+    """Backward-compatible integer wrapper around :func:`estimate_claude_context`."""
 
-    if (
-        isinstance(latest_response_total_tokens, int)
-        and not isinstance(latest_response_total_tokens, bool)
-        and latest_response_total_tokens > 0
-        and previous_messages
-        and len(messages) >= len(previous_messages)
-        and _canonicalize_for_prefix_compare(messages[: len(previous_messages)])
-        == _canonicalize_for_prefix_compare(previous_messages)
-    ):
-        tail = messages[len(previous_messages) :]
-        return latest_response_total_tokens + sum(
-            _estimate_claude_content_tokens(message.get("content"), chars_per_token)
-            for message in tail
-            if isinstance(message, dict)
-        )
-
-    return sum(
-        _estimate_claude_content_tokens(message.get("content"), chars_per_token)
-        for message in tail
-        if isinstance(message, dict)
-    )
+    return estimate_claude_context(
+        messages,
+        model=model,
+        previous_messages=previous_messages,
+        latest_response_total_tokens=latest_response_total_tokens,
+    ).tokens
 
 
 def anthropic_usage_total_tokens(usage: Any) -> int | None:
@@ -208,11 +373,44 @@ def should_accept_cache_pressure_candidate(
     original_tokens: int,
     candidate_tokens: int,
     max_output_ratio: float,
+    *,
+    pressure_tokens: int | None = None,
 ) -> bool:
     """Return whether a candidate saves enough tokens to justify a prefix rewrite."""
     if original_tokens <= 0 or candidate_tokens < 0 or not 0 < max_output_ratio <= 1:
         return False
-    return candidate_tokens <= original_tokens * max_output_ratio
+    if pressure_tokens is None:
+        return candidate_tokens <= original_tokens * max_output_ratio
+    projection = project_cache_pressure_candidate(
+        pressure_tokens=pressure_tokens,
+        baseline_tokens=original_tokens,
+        candidate_tokens=candidate_tokens,
+    )
+    return projection.counted_tokens_saved > 0 and projection.projected_ratio <= max_output_ratio
+
+
+def project_cache_pressure_candidate(
+    *,
+    pressure_tokens: int,
+    baseline_tokens: int,
+    candidate_tokens: int,
+) -> CachePressureCandidateProjection:
+    """Apply exact-count savings to Claude's context estimate.
+
+    The count endpoint may overcount invariant non-text payloads such as base64
+    images.  Subtracting baseline and candidate counts cancels that shared
+    error; applying only the delta to Claude's usage-anchored estimate keeps
+    the acceptance ratio in the same token space as auto-compaction.
+    """
+
+    counted_tokens_saved = baseline_tokens - candidate_tokens
+    projected_tokens = max(0, pressure_tokens - counted_tokens_saved)
+    projected_ratio = projected_tokens / pressure_tokens if pressure_tokens > 0 else math.inf
+    return CachePressureCandidateProjection(
+        counted_tokens_saved=counted_tokens_saved,
+        projected_tokens=projected_tokens,
+        projected_ratio=projected_ratio,
+    )
 
 
 def is_upstream_context_overflow(status_code: int, error_body: Any) -> bool:

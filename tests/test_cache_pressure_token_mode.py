@@ -13,16 +13,24 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from headroom.cache.prefix_tracker import PrefixCacheTracker, _strip_cache_control
+from headroom.cache.prefix_tracker import (
+    CachePressureRejectionMemo,
+    PrefixCacheTracker,
+    _strip_cache_control,
+)
 from headroom.cli.main import main
 from headroom.proxy.cache_pressure_policy import (
     UpstreamContextRescue,
     anthropic_usage_total_tokens,
+    cache_pressure_history_fingerprint,
     claude_auto_compact_threshold,
+    estimate_claude_context,
     estimate_claude_context_tokens,
     is_upstream_context_overflow,
+    project_cache_pressure_candidate,
     should_accept_cache_pressure_candidate,
     should_attempt_cache_pressure,
+    should_retry_cache_pressure_candidate,
 )
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
@@ -106,6 +114,96 @@ def test_claude_context_estimator_uses_latest_api_usage_plus_appended_tail() -> 
         )
         == 290_010
     )
+
+
+def test_claude_context_estimator_keeps_usage_anchor_across_thinking_echo_churn() -> None:
+    previous = [
+        {"role": "user", "content": "old question"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig-a"},
+                {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/a.py"},
+                },
+            ],
+        },
+    ]
+    current = [
+        previous[0],
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": "different-wire-echo"},
+                previous[1]["content"][1],
+            ],
+        },
+        {"role": "user", "content": "x" * 30},
+    ]
+
+    estimate = estimate_claude_context(
+        current,
+        model="gpt-5.6-sol",
+        previous_messages=previous,
+        latest_response_total_tokens=334_633,
+    )
+
+    assert estimate.tokens == 334_643
+    assert estimate.source == "response_usage_relaxed"
+
+
+@pytest.mark.parametrize(
+    "changed_block",
+    [
+        {"type": "text", "text": "changed visible answer"},
+        {
+            "type": "tool_use",
+            "id": "tool-1",
+            "name": "Read",
+            "input": {"file_path": "/tmp/other.py"},
+        },
+    ],
+)
+def test_claude_context_estimator_never_relaxes_visible_or_tool_changes(
+    changed_block: dict[str, object],
+) -> None:
+    previous = [
+        {"role": "user", "content": "old question"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig-a"},
+                {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/a.py"},
+                },
+            ],
+        },
+    ]
+    current = [
+        previous[0],
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": "different-wire-echo"},
+                changed_block,
+            ],
+        },
+    ]
+
+    estimate = estimate_claude_context(
+        current,
+        model="gpt-5.6-sol",
+        previous_messages=previous,
+        latest_response_total_tokens=334_633,
+    )
+
+    assert estimate.source == "full_estimate"
 
 
 def test_anthropic_usage_total_matches_claude_anchor_formula() -> None:
@@ -217,6 +315,142 @@ def test_cache_pressure_candidate_requires_configured_reduction() -> None:
     assert not should_accept_cache_pressure_candidate(350_000, 175_001, 0.50)
     assert not should_accept_cache_pressure_candidate(0, 0, 0.50)
     assert not should_accept_cache_pressure_candidate(350_000, -1, 0.50)
+
+
+def test_cache_pressure_candidate_uses_claude_context_and_exact_count_delta() -> None:
+    projection = project_cache_pressure_candidate(
+        pressure_tokens=334_643,
+        baseline_tokens=581_284,
+        candidate_tokens=513_482,
+    )
+
+    assert projection.counted_tokens_saved == 67_802
+    assert projection.projected_tokens == 266_841
+    assert projection.projected_ratio == pytest.approx(0.797390)
+    assert should_accept_cache_pressure_candidate(
+        581_284,
+        513_482,
+        0.80,
+        pressure_tokens=334_643,
+    )
+
+
+def test_cache_pressure_candidate_rejects_count_inflation() -> None:
+    projection = project_cache_pressure_candidate(
+        pressure_tokens=334_643,
+        baseline_tokens=513_482,
+        candidate_tokens=581_284,
+    )
+
+    assert projection.counted_tokens_saved == -67_802
+    assert projection.projected_tokens == 402_445
+    assert not should_accept_cache_pressure_candidate(
+        513_482,
+        581_284,
+        0.80,
+        pressure_tokens=334_643,
+    )
+
+
+def test_rejected_candidate_waits_for_enough_new_compression_opportunity() -> None:
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    memo = CachePressureRejectionMemo(
+        history_fingerprint=cache_pressure_history_fingerprint(messages),
+        message_count=len(messages),
+        pressure_tokens=334_643,
+        counted_tokens_saved=10_000,
+        max_output_ratio=0.80,
+    )
+
+    assert not should_retry_cache_pressure_candidate(
+        memo,
+        messages + [{"role": "user", "content": "small tail"}],
+        pressure_tokens=335_000,
+        max_output_ratio=0.80,
+    )
+    assert should_retry_cache_pressure_candidate(
+        memo,
+        messages + [{"role": "user", "content": "large new observation"}],
+        pressure_tokens=415_000,
+        max_output_ratio=0.80,
+    )
+
+
+def test_rejected_candidate_retries_when_read_lifecycle_can_change() -> None:
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    memo = CachePressureRejectionMemo(
+        history_fingerprint=cache_pressure_history_fingerprint(messages),
+        message_count=len(messages),
+        pressure_tokens=334_643,
+        counted_tokens_saved=10_000,
+        max_output_ratio=0.80,
+    )
+    reread = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "read-2",
+                "name": "Read",
+                "input": {"file_path": "/tmp/a.py"},
+            }
+        ],
+    }
+
+    assert should_retry_cache_pressure_candidate(
+        memo,
+        messages + [reread],
+        pressure_tokens=335_000,
+        max_output_ratio=0.80,
+    )
+
+
+def test_rejected_candidate_retries_when_a_tool_result_matures_old_history() -> None:
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    memo = CachePressureRejectionMemo(
+        history_fingerprint=cache_pressure_history_fingerprint(messages),
+        message_count=len(messages),
+        pressure_tokens=334_643,
+        counted_tokens_saved=10_000,
+        max_output_ratio=0.80,
+    )
+    new_tool_result = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool-2",
+                "content": "small result",
+            }
+        ],
+    }
+
+    assert should_retry_cache_pressure_candidate(
+        memo,
+        messages + [new_tool_result],
+        pressure_tokens=335_000,
+        max_output_ratio=0.80,
+    )
+
+
+def test_prefix_tracker_records_and_clears_cache_pressure_rejection() -> None:
+    tracker = PrefixCacheTracker("anthropic")
+    memo = CachePressureRejectionMemo("fingerprint", 2, 334_643, 10_000, 0.80)
+
+    tracker.remember_cache_pressure_rejection(memo)
+    assert tracker.get_cache_pressure_rejection() == memo
+
+    tracker.clear_cache_pressure_rejection()
+    assert tracker.get_cache_pressure_rejection() is None
 
 
 @pytest.mark.parametrize(
@@ -388,6 +622,7 @@ class _Tracker:
             {"role": "user", "content": "cached forwarded request"},
             {"role": "assistant", "content": "historical answer"},
         ]
+        self._cache_pressure_rejection = None
 
     def get_frozen_message_count(self) -> int:
         return 2
@@ -400,6 +635,15 @@ class _Tracker:
 
     def get_last_response_total_tokens(self) -> int:
         return self._last_response_total_tokens
+
+    def remember_cache_pressure_rejection(self, memo) -> None:  # noqa: ANN001
+        self._cache_pressure_rejection = memo
+
+    def get_cache_pressure_rejection(self):  # noqa: ANN201
+        return self._cache_pressure_rejection
+
+    def clear_cache_pressure_rejection(self) -> None:
+        self._cache_pressure_rejection = None
 
     def update_from_response(self, **kwargs) -> None:  # noqa: ANN003
         self.previous_original = kwargs["original_messages"].copy()
@@ -429,9 +673,8 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
     [
         (299_199, None, None, "cached forwarded request", "below_threshold"),
         (299_200, None, None, "cached forwarded request", "count_unavailable"),
-        (299_200, 299_199, None, "cached forwarded request", "exact_below_threshold"),
-        (299_200, 350_000, 227_500, "pressure-compressed history", "accepted"),
-        (299_200, 350_000, 227_501, "cached forwarded request", "insufficient_reduction"),
+        (299_200, 350_000, 245_280, "pressure-compressed history", "accepted"),
+        (299_200, 350_000, 245_281, "cached forwarded request", "insufficient_reduction"),
         (299_200, 404_166, 331_602, "cached forwarded request", "insufficient_reduction"),
         (299_200, 350_000, None, "cached forwarded request", "candidate_count_unavailable"),
     ],
@@ -529,14 +772,10 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     assert sent_messages[0]["content"] == expected_first_content
     assert tracker.previous_forwarded[0]["content"] == expected_first_content
     expected_count_calls = (
-        0
-        if expected_decision == "below_threshold"
-        else 1
-        if baseline_tokens is None or expected_decision == "exact_below_threshold"
-        else 2
+        0 if expected_decision == "below_threshold" else 1 if baseline_tokens is None else 2
     )
     assert count_tokens.await_count == expected_count_calls
-    if expected_decision in {"below_threshold", "count_unavailable", "exact_below_threshold"}:
+    if expected_decision in {"below_threshold", "count_unavailable"}:
         assert pressure_pipeline_kwargs == {}
     else:
         assert pressure_pipeline_kwargs["target_ratio"] == 0.12
@@ -545,6 +784,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     tags = captured_logs[0].tags
     assert tags["cache_pressure_decision"] == expected_decision
     assert tags["cache_pressure_trigger_tokens"] == pressure_tokens
+    assert tags["cache_pressure_estimate_source"] == "response_usage"
     assert tags["cache_pressure_effective_context_limit"] == 352_000
     assert tags["cache_pressure_trigger_threshold_tokens"] == 299_200
     assert tags["cache_pressure_context_usage_ratio"] == round(pressure_tokens / 352_000, 6)
@@ -558,10 +798,18 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     else:
         assert tags["cache_pressure_candidate_tokens"] == candidate_tokens
         assert tags["cache_pressure_candidate_ratio"] == round(
+            (pressure_tokens - (baseline_tokens - candidate_tokens)) / pressure_tokens,
+            6,
+        )
+        assert tags["cache_pressure_candidate_count_ratio"] == round(
             candidate_tokens / baseline_tokens,
             6,
         )
-    if expected_decision in {"below_threshold", "count_unavailable", "exact_below_threshold"}:
+        assert tags["cache_pressure_candidate_saved_tokens"] == baseline_tokens - candidate_tokens
+        assert tags["cache_pressure_projected_tokens"] == pressure_tokens - (
+            baseline_tokens - candidate_tokens
+        )
+    if expected_decision in {"below_threshold", "count_unavailable"}:
         assert "cache_pressure_target_ratio" not in tags
     else:
         assert tags["cache_pressure_target_ratio"] == 0.12
@@ -631,9 +879,103 @@ def test_cache_pressure_unchanged_candidate_skips_second_exact_count() -> None:
     assert "cache_pressure_candidate_tokens" not in tags
 
 
+def test_cache_pressure_reuses_rejection_until_new_savings_are_possible() -> None:
+    config = ProxyConfig(
+        mode="cache",
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        image_optimize=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        cache_pressure_token_mode_enabled=True,
+        cache_pressure_trigger_ratio=0.85,
+        cache_pressure_target_ratio=0.12,
+        cache_pressure_max_output_ratio=0.80,
+        cache_pressure_count_timeout_seconds=0.25,
+    )
+    app = create_app(config)
+    tracker = _Tracker()
+    tracker._last_response_total_tokens = 310_000
+    captured_logs: list[object] = []
+    full_candidate_calls = 0
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *_args, **_kwargs: "memo-pressure-session",
+            get_or_create=lambda *_args, **_kwargs: tracker,
+        )
+        proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
+        count_tokens = AsyncMock(side_effect=[350_000, 340_000])
+        proxy._count_anthropic_request_tokens = count_tokens
+        proxy.logger = SimpleNamespace(log=captured_logs.append)
+
+        def apply_pipeline(**kwargs):  # noqa: ANN003, ANN202
+            nonlocal full_candidate_calls
+            forwarded = json.loads(json.dumps(kwargs["messages"]))
+            if kwargs["frozen_message_count"] == 0:
+                full_candidate_calls += 1
+                forwarded[0]["content"] = "pressure-compressed history"
+                return _result(forwarded, marker="cache_pressure:token_mode")
+            return _result(forwarded)
+
+        proxy.anthropic_pipeline.apply = apply_pipeline
+
+        async def fake_retry(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN202
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_pressure",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 310_000,
+                        "output_tokens": 10,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = fake_retry
+        headers = {"x-api-key": "test-key", "anthropic-version": "2023-06-01"}
+
+        first = client.post(
+            "/v1/messages",
+            headers=headers,
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "messages": tracker.previous_original
+                + [{"role": "user", "content": "first live turn"}],
+            },
+        )
+        second = client.post(
+            "/v1/messages",
+            headers=headers,
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "messages": tracker.previous_original
+                + [{"role": "user", "content": "small next turn"}],
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert count_tokens.await_count == 2
+    assert full_candidate_calls == 1
+    assert captured_logs[0].tags["cache_pressure_decision"] == "insufficient_reduction"
+    assert captured_logs[1].tags["cache_pressure_decision"] == ("memoized_insufficient_reduction")
+
+
 _CONTEXT_OVERFLOW_MESSAGE = (
-    "Your input exceeds the context window of this model. "
-    "Please adjust your input and try again."
+    "Your input exceeds the context window of this model. Please adjust your input and try again."
 )
 
 
@@ -780,8 +1122,13 @@ def test_rejected_economic_candidate_is_reused_only_after_real_overflow() -> Non
     assert result.pipeline_frozen_counts.count(0) == 1
     assert result.count_tokens.await_count == 2
     tags = result.captured_logs[0].tags
-    assert tags["cache_pressure_candidate_ratio"] == round(272_348 / 317_212, 6)
+    assert tags["cache_pressure_candidate_ratio"] == round(
+        (299_200 - (317_212 - 272_348)) / 299_200,
+        6,
+    )
+    assert tags["cache_pressure_candidate_count_ratio"] == round(272_348 / 317_212, 6)
     assert tags["cache_pressure_acceptance_reason"] == "upstream_context_rescue"
+    assert result.tracker.get_cache_pressure_rejection() is None
 
 
 def test_upstream_overflow_rescue_stops_after_one_failed_retry() -> None:
@@ -828,7 +1175,7 @@ class _StreamingOverflowTransport(httpx.AsyncBaseTransport):
                 b"event: message_delta\n"
                 b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
                 b'"usage":{"output_tokens":1}}\n\n'
-                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
             ),
         )
 
@@ -911,9 +1258,7 @@ async def test_streaming_overflow_retries_once_with_rescue_body() -> None:
 
     assert result.response.status_code == 200
     assert len(result.transport.bodies) == 2
-    assert result.transport.bodies[1]["messages"][0]["content"] == (
-        "reactive overflow rescue"
-    )
+    assert result.transport.bodies[1]["messages"][0]["content"] == ("reactive overflow rescue")
     assert b"message_stop" in result.body_bytes
     assert result.tracker.previous_forwarded[0]["content"] == "reactive overflow rescue"
     assert result.builder.await_count == 1

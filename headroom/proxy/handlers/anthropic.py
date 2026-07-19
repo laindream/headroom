@@ -750,9 +750,7 @@ class AnthropicHandlerMixin:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
-            client_has_ccr_retrieve_tool = self._has_headroom_retrieve_tool(
-                body.get("tools")
-            )
+            client_has_ccr_retrieve_tool = self._has_headroom_retrieve_tool(body.get("tools"))
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
             # tags assistant blocks with an "index" for SSE re-emission; clients (e.g.
@@ -1604,11 +1602,14 @@ class AnthropicHandlerMixin:
                 and getattr(self, "anthropic_backend", None) is None
             ):
                 from headroom.proxy.cache_pressure_policy import (
+                    cache_pressure_history_fingerprint,
                     claude_auto_compact_threshold,
                     claude_effective_context_limit,
-                    estimate_claude_context_tokens,
+                    estimate_claude_context,
+                    project_cache_pressure_candidate,
                     should_accept_cache_pressure_candidate,
                     should_attempt_cache_pressure,
+                    should_retry_cache_pressure_candidate,
                 )
 
                 context_limit = self.anthropic_provider.get_context_limit(model)
@@ -1617,18 +1618,20 @@ class AnthropicHandlerMixin:
                     if hasattr(prefix_tracker, "get_last_response_total_tokens")
                     else None
                 )
-                pressure_tokens = estimate_claude_context_tokens(
+                pressure_estimate = estimate_claude_context(
                     original_client_messages,
                     model=model,
                     previous_messages=prefix_tracker.get_last_original_messages(),
                     latest_response_total_tokens=latest_response_total_tokens,
                 )
+                pressure_tokens = pressure_estimate.tokens
                 effective_context_limit = claude_effective_context_limit(context_limit)
                 trigger_threshold_tokens = claude_auto_compact_threshold(
                     context_limit,
                     self.config.cache_pressure_trigger_ratio,
                 )
                 tags["cache_pressure_trigger_tokens"] = pressure_tokens
+                tags["cache_pressure_estimate_source"] = pressure_estimate.source
                 tags["cache_pressure_effective_context_limit"] = effective_context_limit
                 tags["cache_pressure_trigger_threshold_tokens"] = trigger_threshold_tokens
                 tags["cache_pressure_context_usage_ratio"] = round(
@@ -1643,29 +1646,48 @@ class AnthropicHandlerMixin:
                     self.config.cache_pressure_trigger_ratio,
                 ):
                     tags["cache_pressure_decision"] = "below_threshold"
+                    if hasattr(prefix_tracker, "clear_cache_pressure_rejection"):
+                        prefix_tracker.clear_cache_pressure_rejection()
                 else:
-                    baseline_body = {**body, "messages": optimized_messages}
-                    baseline_tokens = await self._count_anthropic_request_tokens(
-                        baseline_body,
-                        headers,
+                    rejection_memo = (
+                        prefix_tracker.get_cache_pressure_rejection()
+                        if hasattr(prefix_tracker, "get_cache_pressure_rejection")
+                        else None
                     )
-                    if baseline_tokens is None:
-                        tags["cache_pressure_decision"] = "count_unavailable"
-                    else:
-                        tags["cache_pressure_baseline_tokens"] = baseline_tokens
-                    exact_threshold_met = (
-                        baseline_tokens is not None
-                        and should_attempt_cache_pressure(
-                            baseline_tokens,
-                            context_limit,
-                            self.config.cache_pressure_trigger_ratio,
+                    retry_candidate = rejection_memo is None or (
+                        should_retry_cache_pressure_candidate(
+                            rejection_memo,
+                            original_client_messages,
+                            pressure_tokens=pressure_tokens,
+                            max_output_ratio=self.config.cache_pressure_max_output_ratio,
                         )
                     )
-                    if baseline_tokens is not None and not exact_threshold_met:
-                        tags["cache_pressure_decision"] = "exact_below_threshold"
+                    if not retry_candidate:
+                        baseline_tokens = None
+                        tags["cache_pressure_decision"] = "memoized_insufficient_reduction"
+                        tags["cache_pressure_candidate_saved_tokens"] = (
+                            rejection_memo.counted_tokens_saved
+                        )
+                        tags["cache_pressure_memo_pressure_tokens"] = rejection_memo.pressure_tokens
+                    else:
+                        if rejection_memo is not None and hasattr(
+                            prefix_tracker,
+                            "clear_cache_pressure_rejection",
+                        ):
+                            prefix_tracker.clear_cache_pressure_rejection()
+                        baseline_body = {**body, "messages": optimized_messages}
+                        baseline_tokens = await self._count_anthropic_request_tokens(
+                            baseline_body,
+                            headers,
+                        )
+                        if baseline_tokens is None:
+                            tags["cache_pressure_decision"] = "count_unavailable"
+                        else:
+                            tags["cache_pressure_baseline_tokens"] = baseline_tokens
                     try:
-                        if not exact_threshold_met:
+                        if baseline_tokens is None:
                             raise RuntimeError("cache-pressure baseline count unavailable")
+                        from headroom.cache.prefix_tracker import CachePressureRejectionMemo
                         from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
                         from headroom.transforms.compression_policy import resolve_policy
 
@@ -1707,6 +1729,25 @@ class AnthropicHandlerMixin:
                         # history is still a no-op candidate from this run.
                         if pressure_messages == normalize_message_cache_control(messages):
                             tags["cache_pressure_decision"] = "candidate_unchanged"
+                            if hasattr(
+                                prefix_tracker,
+                                "remember_cache_pressure_rejection",
+                            ):
+                                prefix_tracker.remember_cache_pressure_rejection(
+                                    CachePressureRejectionMemo(
+                                        history_fingerprint=(
+                                            cache_pressure_history_fingerprint(
+                                                original_client_messages
+                                            )
+                                        ),
+                                        message_count=len(original_client_messages),
+                                        pressure_tokens=pressure_tokens,
+                                        counted_tokens_saved=0,
+                                        max_output_ratio=(
+                                            self.config.cache_pressure_max_output_ratio
+                                        ),
+                                    )
+                                )
                         else:
                             precomputed_rescue_baseline = copy.deepcopy(optimized_messages)
                             precomputed_rescue_messages = copy.deepcopy(pressure_messages)
@@ -1717,15 +1758,31 @@ class AnthropicHandlerMixin:
                                 headers,
                             )
                             if candidate_tokens is not None:
+                                projection = project_cache_pressure_candidate(
+                                    pressure_tokens=pressure_tokens,
+                                    baseline_tokens=baseline_tokens,
+                                    candidate_tokens=candidate_tokens,
+                                )
                                 tags["cache_pressure_candidate_tokens"] = candidate_tokens
                                 tags["cache_pressure_candidate_ratio"] = round(
+                                    projection.projected_ratio,
+                                    6,
+                                )
+                                tags["cache_pressure_candidate_count_ratio"] = round(
                                     candidate_tokens / baseline_tokens,
                                     6,
+                                )
+                                tags["cache_pressure_candidate_saved_tokens"] = (
+                                    projection.counted_tokens_saved
+                                )
+                                tags["cache_pressure_projected_tokens"] = (
+                                    projection.projected_tokens
                                 )
                                 candidate_meets_reduction = should_accept_cache_pressure_candidate(
                                     baseline_tokens,
                                     candidate_tokens,
                                     self.config.cache_pressure_max_output_ratio,
+                                    pressure_tokens=pressure_tokens,
                                 )
                             if candidate_tokens is None:
                                 tags["cache_pressure_decision"] = "candidate_count_unavailable"
@@ -1741,28 +1798,57 @@ class AnthropicHandlerMixin:
                                     waste_signals_dict = pressure_result.waste_signals.to_dict()
                                 frozen_message_count = 0
                                 tags["cache_pressure_decision"] = "accepted"
+                                if hasattr(
+                                    prefix_tracker,
+                                    "clear_cache_pressure_rejection",
+                                ):
+                                    prefix_tracker.clear_cache_pressure_rejection()
                                 body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
                                 logger.info(
                                     "[%s] Cache pressure: accepted prefix rewrite "
-                                    "(%s -> %s tokens, pressure=%s/%s)",
+                                    "(count=%s -> %s, projected=%s -> %s, pressure=%s/%s)",
                                     request_id,
                                     baseline_tokens,
                                     candidate_tokens,
+                                    pressure_tokens,
+                                    projection.projected_tokens,
                                     pressure_tokens,
                                     trigger_threshold_tokens,
                                 )
                             else:
                                 tags["cache_pressure_decision"] = "insufficient_reduction"
+                                if hasattr(
+                                    prefix_tracker,
+                                    "remember_cache_pressure_rejection",
+                                ):
+                                    prefix_tracker.remember_cache_pressure_rejection(
+                                        CachePressureRejectionMemo(
+                                            history_fingerprint=(
+                                                cache_pressure_history_fingerprint(
+                                                    original_client_messages
+                                                )
+                                            ),
+                                            message_count=len(original_client_messages),
+                                            pressure_tokens=pressure_tokens,
+                                            counted_tokens_saved=(projection.counted_tokens_saved),
+                                            max_output_ratio=(
+                                                self.config.cache_pressure_max_output_ratio
+                                            ),
+                                        )
+                                    )
                                 logger.info(
                                     "[%s] Cache pressure: rejected prefix rewrite "
-                                    "(%s -> %s tokens, max_output_ratio=%.3f)",
+                                    "(count=%s -> %s, projected=%s -> %s, "
+                                    "max_output_ratio=%.3f)",
                                     request_id,
                                     baseline_tokens,
                                     candidate_tokens,
+                                    pressure_tokens,
+                                    projection.projected_tokens,
                                     self.config.cache_pressure_max_output_ratio,
                                 )
                     except Exception as exc:
-                        if exact_threshold_met:
+                        if baseline_tokens is not None:
                             tags["cache_pressure_decision"] = "candidate_failed"
                             logger.warning(
                                 "[%s] Cache-pressure candidate failed (%s); "
@@ -2831,9 +2917,7 @@ class AnthropicHandlerMixin:
                             normalize_message_cache_control,
                         )
 
-                        rescue_messages = normalize_message_cache_control(
-                            rescue_result.messages
-                        )
+                        rescue_messages = normalize_message_cache_control(rescue_result.messages)
                     except Exception as exc:
                         tags["cache_pressure_rescue_outcome"] = "candidate_failed"
                         logger.warning(
@@ -2843,9 +2927,7 @@ class AnthropicHandlerMixin:
                         )
                         return None
                     finally:
-                        additional_latency_ms = (
-                            time.perf_counter() - rescue_started_at
-                        ) * 1000.0
+                        additional_latency_ms = (time.perf_counter() - rescue_started_at) * 1000.0
 
                 if rescue_result is None or rescue_messages is None:
                     return None
@@ -2994,9 +3076,7 @@ class AnthropicHandlerMixin:
                                 optimized_tokens = rescue.optimized_tokens
                                 tokens_saved = max(0, original_tokens - optimized_tokens)
                                 transforms_applied = list(
-                                    dict.fromkeys(
-                                        [*transforms_applied, *rescue.transforms_applied]
-                                    )
+                                    dict.fromkeys([*transforms_applied, *rescue.transforms_applied])
                                 )
                                 pipeline_timing = {
                                     **pipeline_timing,
@@ -3007,13 +3087,14 @@ class AnthropicHandlerMixin:
                                 optimization_latency += rescue.additional_latency_ms
                                 frozen_message_count = 0
                                 tags["cache_pressure_decision"] = "accepted"
-                                tags["cache_pressure_acceptance_reason"] = (
-                                    "upstream_context_rescue"
-                                )
+                                tags["cache_pressure_acceptance_reason"] = "upstream_context_rescue"
                                 tags["cache_pressure_rescue_outcome"] = "succeeded"
-                                body_mutation_tracker.mark_mutated(
-                                    "upstream_context_rescue"
-                                )
+                                if hasattr(
+                                    prefix_tracker,
+                                    "clear_cache_pressure_rejection",
+                                ):
+                                    prefix_tracker.clear_cache_pressure_rejection()
+                                body_mutation_tracker.mark_mutated("upstream_context_rescue")
                             else:
                                 tags["cache_pressure_rescue_outcome"] = "retry_failed"
                     self.pipeline_extensions.emit(

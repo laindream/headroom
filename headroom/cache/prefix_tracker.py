@@ -84,6 +84,17 @@ class FreezeStats:
     turn_number: int = 0
 
 
+@dataclass(frozen=True)
+class CachePressureRejectionMemo:
+    """Last rejected full-prefix candidate for one client session."""
+
+    history_fingerprint: str
+    message_count: int
+    pressure_tokens: int
+    counted_tokens_saved: int
+    max_output_ratio: float
+
+
 # Cache-miss attribution verdicts. `reason` is one of these literals so
 # metrics/dashboard can bucket without re-deriving the logic. See
 # PrefixCacheTracker.classify_cache_miss.
@@ -430,6 +441,7 @@ class PrefixCacheTracker:
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
         self._last_response_total_tokens: int | None = None
+        self._cache_pressure_rejection: CachePressureRejectionMemo | None = None
         # Idle gap (seconds) since the PREVIOUS turn's response, captured by
         # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
         # _last_activity. Without this snapshot, seconds_since_activity() reads
@@ -552,6 +564,15 @@ class PrefixCacheTracker:
 
     def get_last_response_total_tokens(self) -> int | None:
         return self._last_response_total_tokens
+
+    def remember_cache_pressure_rejection(self, memo: CachePressureRejectionMemo) -> None:
+        self._cache_pressure_rejection = memo
+
+    def get_cache_pressure_rejection(self) -> CachePressureRejectionMemo | None:
+        return self._cache_pressure_rejection
+
+    def clear_cache_pressure_rejection(self) -> None:
+        self._cache_pressure_rejection = None
 
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""
