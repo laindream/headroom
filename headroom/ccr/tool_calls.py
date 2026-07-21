@@ -76,11 +76,11 @@ def is_ccr_tool_call(tool_call: dict[str, Any]) -> bool:
     return (
         is_headroom_mcp_tool_name(tool_call.get("name"), CCR_TOOL_NAME)
         or is_headroom_mcp_tool_name(
-            tool_call.get("function", {}).get("name"),
+            (tool_call.get("function") or {}).get("name"),
             CCR_TOOL_NAME,
         )
         or is_headroom_mcp_tool_name(
-            tool_call.get("functionCall", {}).get("name"),
+            (tool_call.get("functionCall") or {}).get("name"),
             CCR_TOOL_NAME,
         )
     )

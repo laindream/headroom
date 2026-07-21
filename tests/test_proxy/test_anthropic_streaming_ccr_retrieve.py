@@ -289,7 +289,12 @@ def test_nonstreaming_client_owned_headroom_retrieve_is_returned_to_client(monke
     assert continuation_client.post_calls == []
 
 
-def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
+def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
+    """LEGAL mixed turn (#839, #2089): headroom_retrieve emitted alongside a
+    client tool. The proxy cannot synthesize the client tool_result, so it must
+    hand the turn back for the client to resolve — a 200 SSE stream preserving
+    BOTH tool_use blocks, matching the non-streaming path. It must NOT 502 and
+    must NOT issue a continuation request."""
     config = _make_config()
     initial_response = _message_response(
         [
@@ -297,7 +302,7 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
                 "type": "tool_use",
                 "id": "toolu_ccr",
                 "name": "headroom_retrieve",
-                "input": {"hash": "abc123"},
+                "input": {"hash": "abc123abc123abc123abc123"},
             },
             {
                 "type": "tool_use",
@@ -319,6 +324,9 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
         app = create_app(config)
         with TestClient(app) as client:
             proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                side_effect=AssertionError("live streaming path should not be used")
+            )
             continuation_client = _ContinuationClient(_message_response([]))
             proxy.http_client = continuation_client
 
@@ -346,9 +354,71 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
                 },
             )
 
+    assert resp.status_code == 200, resp.text
+    assert "text/event-stream" in resp.headers["content-type"]
+    # Both tool_use blocks are preserved for the client to resolve.
+    assert "headroom_retrieve" in resp.text
+    assert "client_tool" in resp.text
+    assert "toolu_ccr" in resp.text
+    assert "toolu_client" in resp.text
+    assert "Unable to safely complete streamed CCR retrieval" not in resp.text
+    # No continuation is issued — the client resolves all tool calls.
+    assert continuation_client.post_calls == []
+
+
+def test_unresolved_proxy_owned_ccr_fails_closed_as_502() -> None:
+    """A proxy-injected CCR tool must not leak unresolved to an unaware client.
+
+    Client-owned CCR tools stay on the live streaming path (covered above).
+    This request does not declare the tool, so Headroom owns execution; if all
+    continuation rounds still re-emit it, the only safe result is a 502 SSE.
+    """
+    config = _make_config()
+    persistent_ccr = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_ccr",
+                "name": "headroom_retrieve",
+                "input": {"hash": "deadbeefdeadbeefdeadbeef"},
+            },
+        ],
+        stop_reason="tool_use",
+    )
+
+    with (
+        patch("headroom.proxy.server.AnyLLMBackend"),
+        patch(
+            "headroom.proxy.helpers.apply_session_sticky_ccr_tool",
+            side_effect=_inject_proxy_ccr_tool,
+        ),
+    ):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                side_effect=AssertionError("live streaming path should not be used")
+            )
+            # Every continuation re-emits headroom_retrieve, so it never resolves.
+            continuation_client = _ContinuationClient(persistent_ccr)
+            proxy.http_client = continuation_client
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                return httpx.Response(200, json=persistent_ccr)
+
+            proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+            resp = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "use tools"}],
+                },
+            )
+
     assert resp.status_code == 502, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    assert "headroom_retrieve" not in resp.text
-    assert "client_tool" not in resp.text
     assert "Unable to safely complete streamed CCR retrieval" in resp.text
-    assert continuation_client.post_calls == []

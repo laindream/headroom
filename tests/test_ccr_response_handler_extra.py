@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from headroom.ccr.response_handler import (
+    RESIDUAL_CCR_ERROR,
     CCRResponseHandler,
     CCRToolCall,
     CCRToolResult,
@@ -64,6 +65,22 @@ def test_streaming_ccr_buffer_detects_custom_mcp_prefix(
     )
 
     assert buffer.add_chunk(chunk)
+
+
+def test_malformed_named_ccr_call_is_residual_error() -> None:
+    handler = CCRResponseHandler()
+    response = {
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_bad_ccr",
+                "name": CCR_TOOL_NAME,
+                "input": {"hash": "too-short"},
+            }
+        ]
+    }
+
+    assert handler.residual_ccr_status(response, "anthropic") == RESIDUAL_CCR_ERROR
 
 
 def test_extract_tool_calls_google_and_invalid_shapes() -> None:
@@ -448,3 +465,36 @@ async def test_response_to_sse_preserves_anthropic_shape() -> None:
     assert parsed["content"][1]["data"] == "ENC:abc"
     assert parsed["stop_reason"] == "refusal"
     assert parsed["stop_details"] == stop_details
+
+
+def test_reconstruct_server_tool_use_input_from_partial_json() -> None:
+    # StreamingCCRHandler._reconstruct_anthropic_response must parse streamed
+    # input_json_delta into `input` for server_tool_use, not only tool_use.
+    # The narrow type gate left server_tool_use.input malformed and leaked the
+    # `_partial_json` scratch key into replayed assistant history → Anthropic
+    # 400 `server_tool_use.input: Input should be an object` (#2438).
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="anthropic")
+    events = [
+        {"type": "message_start", "message": {"id": "msg_1", "model": "claude-opus-4"}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"query": "x"}'},
+        },
+        {"type": "content_block_stop", "index": 0},
+    ]
+    response = handler._reconstruct_anthropic_response(events)
+    block = response["content"][0]
+    assert block["type"] == "server_tool_use"
+    assert block["input"] == {"query": "x"}
+    assert "_partial_json" not in block

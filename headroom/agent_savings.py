@@ -166,9 +166,15 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         # text-only harness observations trade compression for the same safety.
         compress_user_messages=False,
         compress_system_messages=False,  # system prompt is the hottest cache
-        protect_recent=0,  # tool observations are classified by content, not position
+        # Compress the newest observation delta. In cache mode the delta IS the
+        # newest turn(s), so a positional guard here suppresses the only thing
+        # cache mode can compress (large recent grep/test/build tool output).
+        # The code working set stays byte-exact via protect_reads below — a TYPE
+        # guard on file reads — which is the real fidelity protection, so 0 loses
+        # no correctness while unblocking compression of recent non-read output.
+        protect_recent=0,
         protect_analysis_context=True,
-        min_tokens_to_compress=25,  # low → compression is visible
+        min_tokens_to_compress=10,  # low → even modest deltas are eligible
         max_items_after_crush=15,
         smart_crusher_with_compaction=True,
         force_kompress=False,  # don't override diff/log lossless with lossy ML

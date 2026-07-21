@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.17.16",
+    "@opencode-ai/plugin": "^1.18.2",
     "headroom-ai": "^0.22.3"
   },
   "peerDependencies": {
@@ -41,6 +41,9 @@
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   },
   "license": "Apache-2.0"
 }

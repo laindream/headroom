@@ -767,7 +767,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *_args, **_kwargs: "pressure-session",
-            get_or_create=lambda *_args, **_kwargs: tracker,
+            resolve_tracker=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
         count_results = (
@@ -896,7 +896,7 @@ def test_cache_pressure_unchanged_candidate_skips_second_exact_count() -> None:
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *_args, **_kwargs: "unchanged-pressure-session",
-            get_or_create=lambda *_args, **_kwargs: tracker,
+            resolve_tracker=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
         count_tokens = AsyncMock(return_value=350_000)
@@ -961,7 +961,7 @@ def test_cache_pressure_reuses_rejection_until_new_savings_are_possible() -> Non
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *_args, **_kwargs: "memo-pressure-session",
-            get_or_create=lambda *_args, **_kwargs: tracker,
+            resolve_tracker=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
         count_tokens = AsyncMock(side_effect=[350_000, 340_000])
@@ -1105,7 +1105,7 @@ def _run_context_overflow_rescue_case(
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *_args, **_kwargs: "reactive-rescue-session",
-            get_or_create=lambda *_args, **_kwargs: tracker,
+            resolve_tracker=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
         count_tokens = (
@@ -1380,7 +1380,7 @@ def test_accepted_pressure_prefix_is_reused_by_next_cache_turn(monkeypatch) -> N
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *_args, **_kwargs: "pressure-transition-session",
-            get_or_create=lambda *_args, **_kwargs: tracker,
+            resolve_tracker=lambda *_args, **_kwargs: tracker,
         )
         proxy.anthropic_provider.get_context_limit = lambda _model: 372_000
         proxy._count_anthropic_request_tokens = AsyncMock(side_effect=[350_000, 150_000])
@@ -1516,6 +1516,7 @@ def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
     """A pressure request must not leak its aggressive runtime profile to cache traffic."""
 
     monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "2")
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
 
     class WordTokenizer:
         @staticmethod
@@ -1525,7 +1526,7 @@ def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
     router = ContentRouter(ContentRouterConfig(enable_kompress=False))
     start_barrier = threading.Barrier(2)
     compress_barrier = threading.Barrier(4)
-    observed: dict[str, list[tuple[float | None, bool]]] = {
+    observed: dict[str, list[tuple[float | None, bool, bool]]] = {
         "pressure": [],
         "cache": [],
     }
@@ -1537,6 +1538,7 @@ def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
             (
                 router._runtime_target_ratio,
                 router._runtime_force_kompress,
+                router._runtime_skip_kompress,
             )
         )
         return RouterCompressionResult(
@@ -1547,7 +1549,13 @@ def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
 
     router.compress = fake_compress
 
-    def apply(kind: str, *, target_ratio: float | None, force_kompress: bool) -> None:
+    def apply(
+        kind: str,
+        *,
+        target_ratio: float | None,
+        force_kompress: bool,
+        skip_kompress: bool,
+    ) -> None:
         start_barrier.wait(timeout=3)
         router.apply(
             messages=[
@@ -1558,6 +1566,7 @@ def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
             compress_user_messages=True,
             target_ratio=target_ratio,
             force_kompress=force_kompress,
+            skip_kompress=skip_kompress,
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1566,17 +1575,19 @@ def test_content_router_request_overrides_are_isolated_across_concurrent_calls(
             "pressure",
             target_ratio=0.10,
             force_kompress=True,
+            skip_kompress=True,
         )
         cache = executor.submit(
             apply,
             "cache",
             target_ratio=None,
             force_kompress=False,
+            skip_kompress=False,
         )
         pressure.result(timeout=3)
         cache.result(timeout=3)
 
     assert observed == {
-        "pressure": [(0.10, True), (0.10, True)],
-        "cache": [(None, False), (None, False)],
+        "pressure": [(0.10, True, True), (0.10, True, True)],
+        "cache": [(None, False, False), (None, False, False)],
     }
