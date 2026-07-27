@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -7,6 +9,7 @@ httpx = pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.ccr.tool_injection import create_ccr_tool_definition  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
@@ -100,6 +103,12 @@ def _anthropic_message_response() -> dict[str, object]:
             "cache_creation_input_tokens": 0,
         },
     }
+
+
+def _inject_proxy_ccr_tool(**kwargs) -> tuple[list[dict], bool]:  # noqa: ANN003
+    return list(kwargs.get("existing_tools") or []) + [
+        create_ccr_tool_definition("anthropic")
+    ], True
 
 
 def _anthropic_batch_response() -> dict[str, object]:
@@ -301,7 +310,13 @@ def test_anthropic_ccr_continuation_uses_buffered_timeout() -> None:
                 tools,
             )
 
-    with TestClient(app) as client:
+    with (
+        patch(
+            "headroom.proxy.helpers.apply_session_sticky_ccr_tool",
+            side_effect=_inject_proxy_ccr_tool,
+        ),
+        TestClient(app) as client,
+    ):
         proxy = client.app.state.proxy
         _install_prefix_tracker(proxy)
         proxy.ccr_response_handler = _CCRHandler()
