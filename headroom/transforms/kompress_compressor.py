@@ -986,13 +986,42 @@ _download_threads: dict[str, threading.Thread] = {}
 _download_threads_lock = threading.Lock()
 
 
-def _background_download(model_id: str, device: str) -> None:
+def _background_load(
+    model_id: str,
+    device: str,
+    allow_download: bool,
+) -> None:
     try:
-        logger.info("Kompress: downloading model %s in the background ...", model_id)
-        _load_kompress(model_id, device, allow_download=True)
-        logger.info("Kompress: background model download complete for %s", model_id)
+        action = "downloading" if allow_download else "loading cached"
+        logger.info("Kompress: %s model %s in the background ...", action, model_id)
+        _load_kompress(model_id, device, allow_download=allow_download)
+        logger.info("Kompress: background model load complete for %s", model_id)
     except Exception as exc:
-        logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
+        logger.warning("Kompress: background model load failed for %s: %s", model_id, exc)
+
+
+def _ensure_background_load(
+    model_id: str,
+    device: str,
+    *,
+    allow_download: bool,
+) -> None:
+    if model_id in _kompress_cache:
+        return
+    with _download_threads_lock:
+        if model_id in _kompress_cache:
+            return
+        existing = _download_threads.get(model_id)
+        if existing is not None and existing.is_alive():
+            return
+        thread = threading.Thread(
+            target=_background_load,
+            args=(model_id, device, allow_download),
+            name=f"kompress-load-{model_id.replace('/', '-')}",
+            daemon=True,
+        )
+        _download_threads[model_id] = thread
+        thread.start()
 
 
 def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto") -> None:
@@ -1004,22 +1033,15 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
     completes the deep path activates on subsequent requests without ever
     blocking one on the network.
     """
-    if model_id in _kompress_cache:
-        return
-    with _download_threads_lock:
-        if model_id in _kompress_cache:
-            return
-        existing = _download_threads.get(model_id)
-        if existing is not None and existing.is_alive():
-            return
-        thread = threading.Thread(
-            target=_background_download,
-            args=(model_id, device),
-            name=f"kompress-download-{model_id.replace('/', '-')}",
-            daemon=True,
-        )
-        _download_threads[model_id] = thread
-        thread.start()
+    _ensure_background_load(model_id, device, allow_download=True)
+
+
+def ensure_background_cache_load(
+    model_id: str = HF_MODEL_ID,
+    device: str = "auto",
+) -> None:
+    """Load a previously downloaded model off-thread without network access."""
+    _ensure_background_load(model_id, device, allow_download=False)
 
 
 def warm_kompress_model(
@@ -1264,6 +1286,10 @@ class KompressCompressor(Transform):
         No-op when the model is already cached or a download is already running.
         """
         ensure_background_download(self.config.model_id, self.config.device)
+
+    def ensure_background_cache_load(self) -> None:
+        """Load cached assets off-thread; never download during proxy startup."""
+        ensure_background_cache_load(self.config.model_id, self.config.device)
 
     def compress(
         self,

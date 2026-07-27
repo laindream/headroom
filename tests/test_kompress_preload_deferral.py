@@ -98,12 +98,16 @@ class _StubCompressor:
     def __init__(self, *, cached: bool):
         self._cached = cached
         self.preload_calls: list[bool] = []
+        self.background_cache_loads = 0
 
     def preload(self, *, allow_download: bool = True) -> str:
         self.preload_calls.append(allow_download)
         if self._cached:
             return "onnx"
         raise KompressModelNotCached("org/model")
+
+    def ensure_background_cache_load(self) -> None:
+        self.background_cache_loads += 1
 
 
 class _FatalPreloadCompressor(_StubCompressor):
@@ -132,6 +136,33 @@ def test_eager_load_defers_kompress_regardless_of_cache_state(monkeypatch, cache
 
     assert status["kompress"] == "deferred"
     assert stub.preload_calls == []
+    assert stub.background_cache_loads == 0
+
+
+def test_eager_load_can_start_cache_only_background_preload(monkeypatch):
+    router = _router_kompress_only()
+    stub = _StubCompressor(cached=True)
+    monkeypatch.setattr(router, "_get_kompress", lambda: stub)
+    monkeypatch.setenv("HEADROOM_KOMPRESS_EAGER_PRELOAD", "1")
+
+    status = router.eager_load_compressors()
+
+    assert status["kompress"] == "deferred"
+    assert stub.preload_calls == []
+    assert stub.background_cache_loads == 1
+
+
+def test_background_cache_load_disallows_network(monkeypatch):
+    calls: list[tuple[str, str, bool]] = []
+
+    def fake_ensure(model_id, device, *, allow_download):
+        calls.append((model_id, device, allow_download))
+
+    monkeypatch.setattr(kc, "_ensure_background_load", fake_ensure)
+
+    kc.ensure_background_cache_load("org/model", "mps")
+
+    assert calls == [("org/model", "mps", False)]
 
 
 def test_eager_load_keeps_disabled_kompress_disabled(monkeypatch):

@@ -85,6 +85,8 @@ from .relevance_split import build_relevance_query, plan_relevance_split
 
 logger = logging.getLogger(__name__)
 
+KOMPRESS_EAGER_PRELOAD_ENV = "HEADROOM_KOMPRESS_EAGER_PRELOAD"
+
 
 def _must_preserve_tool_result(tool_name: str, protected_tools: Any) -> bool:
     """Protect configured control results and the CCR recovery channel."""
@@ -4000,7 +4002,9 @@ class ContentRouter(Transform):
         # 1. ML text compressor: Kompress.
         #
         # Native model initialization stays out of the blocking startup/lifespan
-        # path. The existing lazy request path loads Kompress on first use.
+        # path. Operators that explicitly pre-stage the model may opt into a
+        # cache-only background load; startup still binds before native loading
+        # and the load path is forbidden from touching the network.
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
@@ -4008,7 +4012,17 @@ class ContentRouter(Transform):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
-                    logger.info("Kompress model preload deferred until first request")
+                    eager_cached = os.environ.get(KOMPRESS_EAGER_PRELOAD_ENV, "").strip() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+                    if eager_cached and hasattr(compressor, "ensure_background_cache_load"):
+                        compressor.ensure_background_cache_load()
+                        logger.info("Kompress cache-only background preload started")
+                    else:
+                        logger.info("Kompress model preload deferred until first request")
                     status["kompress"] = "deferred"
             else:
                 status["kompress"] = "unavailable"
