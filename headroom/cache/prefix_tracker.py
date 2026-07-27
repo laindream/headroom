@@ -465,6 +465,7 @@ class PrefixCacheTracker:
         self._last_response_total_tokens: int | None = None
         self._last_response_total_is_lower_bound: bool = False
         self._cache_pressure_rejection: CachePressureRejectionMemo | None = None
+        self._cache_pressure_cooldown_remaining: int = 0
         # Idle gap (seconds) since the PREVIOUS turn's response, captured by
         # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
         # _last_activity. Without this snapshot, seconds_since_activity() reads
@@ -606,6 +607,17 @@ class PrefixCacheTracker:
 
     def clear_cache_pressure_rejection(self) -> None:
         self._cache_pressure_rejection = None
+
+    def start_cache_pressure_cooldown(self, requests: int) -> None:
+        self._cache_pressure_cooldown_remaining = max(0, requests)
+
+    def consume_cache_pressure_cooldown(self) -> int:
+        """Return the current cooldown and consume one subsequent request."""
+
+        remaining = self._cache_pressure_cooldown_remaining
+        if remaining > 0:
+            self._cache_pressure_cooldown_remaining -= 1
+        return remaining
 
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""

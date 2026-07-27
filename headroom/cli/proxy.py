@@ -1191,6 +1191,9 @@ def proxy(
         cache_pressure_token_mode_enabled=_get_env_bool(
             "HEADROOM_CACHE_PRESSURE_TOKEN_MODE", False
         ),
+        cache_pressure_context_limit_tokens=_get_env_int_optional(
+            "HEADROOM_CACHE_PRESSURE_CONTEXT_LIMIT_TOKENS"
+        ),
         cache_pressure_trigger_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", 0.85),
         cache_pressure_target_ratio=_get_env_float("HEADROOM_CACHE_PRESSURE_TARGET_RATIO", 0.10),
         cache_pressure_max_output_ratio=_get_env_float(
@@ -1198,6 +1201,9 @@ def proxy(
         ),
         cache_pressure_count_timeout_seconds=_get_env_float(
             "HEADROOM_CACHE_PRESSURE_COUNT_TIMEOUT_SECONDS", 5.0
+        ),
+        cache_pressure_cooldown_requests=_get_env_int(
+            "HEADROOM_CACHE_PRESSURE_COOLDOWN_REQUESTS", 10
         ),
         lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
         protect_recent_tool_result_turns=_get_env_int(

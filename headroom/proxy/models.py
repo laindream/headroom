@@ -170,12 +170,17 @@ class ProxyConfig:
     # near the model limit, one token-mode candidate may replace the cached
     # prefix when the configured reduction is large enough.
     cache_pressure_token_mode_enabled: bool = False
+    # Optional policy ceiling independent of the provider's real model limit.
+    # This lets operators trigger before a billing or client-compaction boundary
+    # without lying to compression pipelines about the model's actual capacity.
+    cache_pressure_context_limit_tokens: int | None = None
     cache_pressure_trigger_ratio: float = 0.85
     # Per-content keep ratio for the aggressive pressure candidate. The
     # whole-request rewrite is still gated by cache_pressure_max_output_ratio.
     cache_pressure_target_ratio: float = 0.10
     cache_pressure_max_output_ratio: float = 0.50
     cache_pressure_count_timeout_seconds: float = 5.0
+    cache_pressure_cooldown_requests: int = 10
 
     # Strict coding-agent safety boundary. When enabled, lossy transforms may
     # mutate only old, explicitly allowlisted tool results. Unknown tools,
@@ -506,12 +511,19 @@ class ProxyConfig:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
         if not 0 < self.cache_pressure_trigger_ratio <= 1:
             raise ValueError("cache_pressure_trigger_ratio must be in (0, 1]")
+        if (
+            self.cache_pressure_context_limit_tokens is not None
+            and self.cache_pressure_context_limit_tokens <= 0
+        ):
+            raise ValueError("cache_pressure_context_limit_tokens must be > 0")
         if not 0 < self.cache_pressure_target_ratio <= 1:
             raise ValueError("cache_pressure_target_ratio must be in (0, 1]")
         if not 0 < self.cache_pressure_max_output_ratio <= 1:
             raise ValueError("cache_pressure_max_output_ratio must be in (0, 1]")
         if not self.cache_pressure_count_timeout_seconds > 0:
             raise ValueError("cache_pressure_count_timeout_seconds must be > 0")
+        if self.cache_pressure_cooldown_requests < 0:
+            raise ValueError("cache_pressure_cooldown_requests must be >= 0")
         # A 0 (or negative) requests-per-minute limit divides by zero in the
         # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
         # 500-ing every request. The CLI already guards this with IntRange(min=1);

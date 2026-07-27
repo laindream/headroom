@@ -1698,6 +1698,13 @@ class AnthropicHandlerMixin:
             # deliberately supersedes that overlay for one request;
             # update_from_response later records the new forwarded prefix for
             # subsequent cache-mode turns.
+            cache_pressure_cooldown_remaining = 0
+            if (
+                self.config.cache_pressure_token_mode_enabled
+                and is_cache_mode(self.config.mode)
+                and hasattr(prefix_tracker, "consume_cache_pressure_cooldown")
+            ):
+                cache_pressure_cooldown_remaining = prefix_tracker.consume_cache_pressure_cooldown()
             if (
                 self.config.cache_pressure_token_mode_enabled
                 and is_cache_mode(self.config.mode)
@@ -1719,6 +1726,12 @@ class AnthropicHandlerMixin:
                 )
 
                 context_limit = self.anthropic_provider.get_context_limit(model)
+                configured_pressure_limit = self.config.cache_pressure_context_limit_tokens
+                pressure_context_limit = (
+                    min(context_limit, configured_pressure_limit)
+                    if configured_pressure_limit is not None
+                    else context_limit
+                )
                 latest_response_total_tokens = (
                     prefix_tracker.get_last_response_total_tokens()
                     if hasattr(prefix_tracker, "get_last_response_total_tokens")
@@ -1737,13 +1750,15 @@ class AnthropicHandlerMixin:
                     latest_response_total_is_lower_bound=latest_response_total_is_lower_bound,
                 )
                 pressure_tokens = pressure_estimate.tokens
-                effective_context_limit = claude_effective_context_limit(context_limit)
+                effective_context_limit = claude_effective_context_limit(pressure_context_limit)
                 trigger_threshold_tokens = claude_auto_compact_threshold(
-                    context_limit,
+                    pressure_context_limit,
                     self.config.cache_pressure_trigger_ratio,
                 )
                 tags["cache_pressure_trigger_tokens"] = pressure_tokens
                 tags["cache_pressure_estimate_source"] = pressure_estimate.source
+                tags["cache_pressure_provider_context_limit"] = context_limit
+                tags["cache_pressure_policy_context_limit"] = pressure_context_limit
                 tags["cache_pressure_effective_context_limit"] = effective_context_limit
                 tags["cache_pressure_trigger_threshold_tokens"] = trigger_threshold_tokens
                 tags["cache_pressure_context_usage_ratio"] = round(
@@ -1752,9 +1767,12 @@ class AnthropicHandlerMixin:
                     else 0.0,
                     6,
                 )
-                if not should_attempt_cache_pressure(
+                tags["cache_pressure_cooldown_remaining"] = cache_pressure_cooldown_remaining
+                if cache_pressure_cooldown_remaining > 0:
+                    tags["cache_pressure_decision"] = "cooldown"
+                elif not should_attempt_cache_pressure(
                     pressure_tokens,
-                    context_limit,
+                    pressure_context_limit,
                     self.config.cache_pressure_trigger_ratio,
                 ):
                     tags["cache_pressure_decision"] = "below_threshold"
@@ -1924,6 +1942,13 @@ class AnthropicHandlerMixin:
                                     "clear_cache_pressure_rejection",
                                 ):
                                     prefix_tracker.clear_cache_pressure_rejection()
+                                if hasattr(
+                                    prefix_tracker,
+                                    "start_cache_pressure_cooldown",
+                                ):
+                                    prefix_tracker.start_cache_pressure_cooldown(
+                                        self.config.cache_pressure_cooldown_requests
+                                    )
                                 body_mutation_tracker.mark_mutated("cache_pressure_token_mode")
                                 logger.info(
                                     "[%s] Cache pressure: accepted prefix rewrite "
@@ -3405,6 +3430,13 @@ class AnthropicHandlerMixin:
                                         "clear_cache_pressure_rejection",
                                     ):
                                         prefix_tracker.clear_cache_pressure_rejection()
+                                    if hasattr(
+                                        prefix_tracker,
+                                        "start_cache_pressure_cooldown",
+                                    ):
+                                        prefix_tracker.start_cache_pressure_cooldown(
+                                            self.config.cache_pressure_cooldown_requests
+                                        )
                                     body_mutation_tracker.mark_mutated("upstream_context_rescue")
                                 else:
                                     tags["cache_pressure_rescue_outcome"] = "retry_failed"

@@ -1467,6 +1467,10 @@ class StreamingMixin:
                             tags["cache_pressure_decision"] = "accepted"
                             tags["cache_pressure_acceptance_reason"] = "upstream_context_rescue"
                             tags["cache_pressure_rescue_outcome"] = "succeeded"
+                            if hasattr(prefix_tracker, "start_cache_pressure_cooldown"):
+                                prefix_tracker.start_cache_pressure_cooldown(
+                                    self.config.cache_pressure_cooldown_requests
+                                )
                         else:
                             tags["cache_pressure_rescue_outcome"] = "retry_failed"
 

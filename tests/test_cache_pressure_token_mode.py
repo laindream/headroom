@@ -50,6 +50,15 @@ def test_cache_pressure_threshold_matches_claude_effective_window() -> None:
 
 def test_cache_pressure_default_trigger_ratio_is_85_percent() -> None:
     assert ProxyConfig().cache_pressure_trigger_ratio == 0.85
+    assert ProxyConfig().cache_pressure_context_limit_tokens is None
+    assert ProxyConfig().cache_pressure_cooldown_requests == 10
+
+
+def test_cache_pressure_context_limit_and_cooldown_validate() -> None:
+    with pytest.raises(ValueError, match="cache_pressure_context_limit_tokens"):
+        ProxyConfig(cache_pressure_context_limit_tokens=0)
+    with pytest.raises(ValueError, match="cache_pressure_cooldown_requests"):
+        ProxyConfig(cache_pressure_cooldown_requests=-1)
 
 
 def test_claude_context_estimator_matches_custom_model_content_rules() -> None:
@@ -507,6 +516,16 @@ def test_prefix_tracker_records_and_clears_cache_pressure_rejection() -> None:
     assert tracker.get_cache_pressure_rejection() is None
 
 
+def test_prefix_tracker_consumes_cache_pressure_cooldown_per_request() -> None:
+    tracker = PrefixCacheTracker("anthropic")
+
+    tracker.start_cache_pressure_cooldown(2)
+
+    assert tracker.consume_cache_pressure_cooldown() == 2
+    assert tracker.consume_cache_pressure_cooldown() == 1
+    assert tracker.consume_cache_pressure_cooldown() == 0
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -619,6 +638,8 @@ def test_direct_server_env_reads_cache_pressure_policy(monkeypatch) -> None:
     from headroom.proxy.server import _proxy_config_from_env
 
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TOKEN_MODE", "1")
+    monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_CONTEXT_LIMIT_TOKENS", "270000")
+    monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_COOLDOWN_REQUESTS", "7")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", "0.91")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TARGET_RATIO", "0.12")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", "0.49")
@@ -627,6 +648,8 @@ def test_direct_server_env_reads_cache_pressure_policy(monkeypatch) -> None:
     config = _proxy_config_from_env()
 
     assert config.cache_pressure_token_mode_enabled is True
+    assert config.cache_pressure_context_limit_tokens == 270_000
+    assert config.cache_pressure_cooldown_requests == 7
     assert config.cache_pressure_trigger_ratio == 0.91
     assert config.cache_pressure_target_ratio == 0.12
     assert config.cache_pressure_max_output_ratio == 0.49
@@ -646,6 +669,8 @@ def test_click_proxy_env_reads_cache_pressure_policy() -> None:
             ["proxy"],
             env={
                 "HEADROOM_CACHE_PRESSURE_TOKEN_MODE": "1",
+                "HEADROOM_CACHE_PRESSURE_CONTEXT_LIMIT_TOKENS": "270000",
+                "HEADROOM_CACHE_PRESSURE_COOLDOWN_REQUESTS": "7",
                 "HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO": "0.91",
                 "HEADROOM_CACHE_PRESSURE_TARGET_RATIO": "0.12",
                 "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO": "0.49",
@@ -657,6 +682,8 @@ def test_click_proxy_env_reads_cache_pressure_policy() -> None:
     assert result.exit_code == 0, result.output
     config = captured["config"]
     assert config.cache_pressure_token_mode_enabled is True
+    assert config.cache_pressure_context_limit_tokens == 270_000
+    assert config.cache_pressure_cooldown_requests == 7
     assert config.cache_pressure_trigger_ratio == 0.91
     assert config.cache_pressure_target_ratio == 0.12
     assert config.cache_pressure_max_output_ratio == 0.49
@@ -677,6 +704,7 @@ class _Tracker:
             {"role": "assistant", "content": "historical answer"},
         ]
         self._cache_pressure_rejection = None
+        self._cache_pressure_cooldown_remaining = 0
 
     def get_frozen_message_count(self) -> int:
         return 2
@@ -698,6 +726,15 @@ class _Tracker:
 
     def clear_cache_pressure_rejection(self) -> None:
         self._cache_pressure_rejection = None
+
+    def start_cache_pressure_cooldown(self, requests: int) -> None:
+        self._cache_pressure_cooldown_remaining = max(0, requests)
+
+    def consume_cache_pressure_cooldown(self) -> int:
+        remaining = self._cache_pressure_cooldown_remaining
+        if remaining > 0:
+            self._cache_pressure_cooldown_remaining -= 1
+        return remaining
 
     def update_from_response(self, **kwargs) -> None:  # noqa: ANN003
         self.previous_original = kwargs["original_messages"].copy()
@@ -723,14 +760,51 @@ def _result(messages, *, marker: str = "cache"):  # noqa: ANN001, ANN202
         "candidate_tokens",
         "expected_first_content",
         "expected_decision",
+        "pressure_context_limit_tokens",
+        "initial_cooldown_requests",
     ),
     [
-        (299_199, None, None, "cached forwarded request", "below_threshold"),
-        (299_200, None, None, "cached forwarded request", "count_unavailable"),
-        (299_200, 350_000, 245_280, "pressure-compressed history", "accepted"),
-        (299_200, 350_000, 245_281, "cached forwarded request", "insufficient_reduction"),
-        (299_200, 404_166, 331_602, "cached forwarded request", "insufficient_reduction"),
-        (299_200, 350_000, None, "cached forwarded request", "candidate_count_unavailable"),
+        (299_199, None, None, "cached forwarded request", "below_threshold", None, 0),
+        (299_200, None, None, "cached forwarded request", "count_unavailable", None, 0),
+        (299_200, 350_000, 245_280, "pressure-compressed history", "accepted", None, 0),
+        (
+            299_200,
+            350_000,
+            245_281,
+            "cached forwarded request",
+            "insufficient_reduction",
+            None,
+            0,
+        ),
+        (
+            299_200,
+            404_166,
+            331_602,
+            "cached forwarded request",
+            "insufficient_reduction",
+            None,
+            0,
+        ),
+        (
+            299_200,
+            350_000,
+            None,
+            "cached forwarded request",
+            "candidate_count_unavailable",
+            None,
+            0,
+        ),
+        (212_499, None, None, "cached forwarded request", "below_threshold", 270_000, 0),
+        (
+            212_500,
+            350_000,
+            275_625,
+            "pressure-compressed history",
+            "accepted",
+            270_000,
+            0,
+        ),
+        (350_000, None, None, "cached forwarded request", "cooldown", None, 10),
     ],
 )
 def test_cache_pressure_candidate_controls_prefix_overlay(
@@ -739,6 +813,8 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     candidate_tokens: int | None,
     expected_first_content: str,
     expected_decision: str,
+    pressure_context_limit_tokens: int | None,
+    initial_cooldown_requests: int,
 ) -> None:
     config = ProxyConfig(
         mode="cache",
@@ -752,6 +828,8 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         ccr_handle_responses=False,
         ccr_context_tracking=False,
         cache_pressure_token_mode_enabled=True,
+        cache_pressure_context_limit_tokens=pressure_context_limit_tokens,
+        cache_pressure_cooldown_requests=10,
         cache_pressure_trigger_ratio=0.85,
         cache_pressure_target_ratio=0.12,
         cache_pressure_max_output_ratio=0.65,
@@ -763,6 +841,7 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     pressure_pipeline_kwargs: dict[str, object] = {}
     tracker = _Tracker()
     tracker._last_response_total_tokens = pressure_tokens - 4
+    tracker._cache_pressure_cooldown_remaining = initial_cooldown_requests
     with TestClient(app) as client:
         proxy = client.app.state.proxy
         proxy.session_tracker_store = SimpleNamespace(
@@ -826,10 +905,14 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     assert sent_messages[0]["content"] == expected_first_content
     assert tracker.previous_forwarded[0]["content"] == expected_first_content
     expected_count_calls = (
-        0 if expected_decision == "below_threshold" else 1 if baseline_tokens is None else 2
+        0
+        if expected_decision in {"below_threshold", "cooldown"}
+        else 1
+        if baseline_tokens is None
+        else 2
     )
     assert count_tokens.await_count == expected_count_calls
-    if expected_decision in {"below_threshold", "count_unavailable"}:
+    if expected_decision in {"below_threshold", "cooldown", "count_unavailable"}:
         assert pressure_pipeline_kwargs == {}
     else:
         assert pressure_pipeline_kwargs["target_ratio"] == 0.12
@@ -837,11 +920,19 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
     assert len(captured_logs) == 1
     tags = captured_logs[0].tags
     assert tags["cache_pressure_decision"] == expected_decision
+    assert tags["cache_pressure_cooldown_remaining"] == initial_cooldown_requests
     assert tags["cache_pressure_trigger_tokens"] == pressure_tokens
     assert tags["cache_pressure_estimate_source"] == "response_usage"
-    assert tags["cache_pressure_effective_context_limit"] == 352_000
-    assert tags["cache_pressure_trigger_threshold_tokens"] == 299_200
-    assert tags["cache_pressure_context_usage_ratio"] == round(pressure_tokens / 352_000, 6)
+    policy_context_limit = pressure_context_limit_tokens or 372_000
+    effective_context_limit = policy_context_limit - 20_000
+    trigger_threshold = min(int(effective_context_limit * 0.85), effective_context_limit - 13_000)
+    assert tags["cache_pressure_provider_context_limit"] == 372_000
+    assert tags["cache_pressure_policy_context_limit"] == policy_context_limit
+    assert tags["cache_pressure_effective_context_limit"] == effective_context_limit
+    assert tags["cache_pressure_trigger_threshold_tokens"] == trigger_threshold
+    assert tags["cache_pressure_context_usage_ratio"] == round(
+        pressure_tokens / effective_context_limit, 6
+    )
     if baseline_tokens is None:
         assert "cache_pressure_baseline_tokens" not in tags
     else:
@@ -863,10 +954,14 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         assert tags["cache_pressure_projected_tokens"] == pressure_tokens - (
             baseline_tokens - candidate_tokens
         )
-    if expected_decision in {"below_threshold", "count_unavailable"}:
+    if expected_decision in {"below_threshold", "cooldown", "count_unavailable"}:
         assert "cache_pressure_target_ratio" not in tags
     else:
         assert tags["cache_pressure_target_ratio"] == 0.12
+    if expected_decision == "accepted":
+        assert tracker._cache_pressure_cooldown_remaining == 10
+    elif expected_decision == "cooldown":
+        assert tracker._cache_pressure_cooldown_remaining == 9
 
 
 def test_cache_pressure_unchanged_candidate_skips_second_exact_count() -> None:
