@@ -53,6 +53,9 @@ def test_cache_pressure_default_trigger_ratio_is_85_percent() -> None:
     assert ProxyConfig().cache_pressure_context_limit_tokens is None
     assert ProxyConfig().cache_pressure_cooldown_requests == 10
     assert ProxyConfig().cache_pressure_protect_recent_messages == 4
+    assert ProxyConfig().cache_pressure_protect_recent_tokens == 0
+    assert ProxyConfig().cache_pressure_assistant_target_ratio is None
+    assert ProxyConfig().cache_pressure_min_content_tokens == 0
 
 
 def test_cache_pressure_context_limit_and_cooldown_validate() -> None:
@@ -62,6 +65,12 @@ def test_cache_pressure_context_limit_and_cooldown_validate() -> None:
         ProxyConfig(cache_pressure_cooldown_requests=-1)
     with pytest.raises(ValueError, match="cache_pressure_protect_recent_messages"):
         ProxyConfig(cache_pressure_protect_recent_messages=-1)
+    with pytest.raises(ValueError, match="cache_pressure_protect_recent_tokens"):
+        ProxyConfig(cache_pressure_protect_recent_tokens=-1)
+    with pytest.raises(ValueError, match="cache_pressure_assistant_target_ratio"):
+        ProxyConfig(cache_pressure_assistant_target_ratio=0)
+    with pytest.raises(ValueError, match="cache_pressure_min_content_tokens"):
+        ProxyConfig(cache_pressure_min_content_tokens=-1)
 
 
 def test_claude_context_estimator_matches_custom_model_content_rules() -> None:
@@ -644,6 +653,9 @@ def test_direct_server_env_reads_cache_pressure_policy(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_CONTEXT_LIMIT_TOKENS", "270000")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_COOLDOWN_REQUESTS", "7")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_MESSAGES", "6")
+    monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_TOKENS", "16000")
+    monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_ASSISTANT_TARGET_RATIO", "0.25")
+    monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_MIN_CONTENT_TOKENS", "128")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO", "0.91")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_TARGET_RATIO", "0.12")
     monkeypatch.setenv("HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO", "0.49")
@@ -655,6 +667,9 @@ def test_direct_server_env_reads_cache_pressure_policy(monkeypatch) -> None:
     assert config.cache_pressure_context_limit_tokens == 270_000
     assert config.cache_pressure_cooldown_requests == 7
     assert config.cache_pressure_protect_recent_messages == 6
+    assert config.cache_pressure_protect_recent_tokens == 16_000
+    assert config.cache_pressure_assistant_target_ratio == 0.25
+    assert config.cache_pressure_min_content_tokens == 128
     assert config.cache_pressure_trigger_ratio == 0.91
     assert config.cache_pressure_target_ratio == 0.12
     assert config.cache_pressure_max_output_ratio == 0.49
@@ -677,6 +692,9 @@ def test_click_proxy_env_reads_cache_pressure_policy() -> None:
                 "HEADROOM_CACHE_PRESSURE_CONTEXT_LIMIT_TOKENS": "270000",
                 "HEADROOM_CACHE_PRESSURE_COOLDOWN_REQUESTS": "7",
                 "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_MESSAGES": "6",
+                "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_TOKENS": "16000",
+                "HEADROOM_CACHE_PRESSURE_ASSISTANT_TARGET_RATIO": "0.25",
+                "HEADROOM_CACHE_PRESSURE_MIN_CONTENT_TOKENS": "128",
                 "HEADROOM_CACHE_PRESSURE_TRIGGER_RATIO": "0.91",
                 "HEADROOM_CACHE_PRESSURE_TARGET_RATIO": "0.12",
                 "HEADROOM_CACHE_PRESSURE_MAX_OUTPUT_RATIO": "0.49",
@@ -691,6 +709,9 @@ def test_click_proxy_env_reads_cache_pressure_policy() -> None:
     assert config.cache_pressure_context_limit_tokens == 270_000
     assert config.cache_pressure_cooldown_requests == 7
     assert config.cache_pressure_protect_recent_messages == 6
+    assert config.cache_pressure_protect_recent_tokens == 16_000
+    assert config.cache_pressure_assistant_target_ratio == 0.25
+    assert config.cache_pressure_min_content_tokens == 128
     assert config.cache_pressure_trigger_ratio == 0.91
     assert config.cache_pressure_target_ratio == 0.12
     assert config.cache_pressure_max_output_ratio == 0.49
@@ -837,6 +858,9 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         cache_pressure_token_mode_enabled=True,
         cache_pressure_context_limit_tokens=pressure_context_limit_tokens,
         cache_pressure_cooldown_requests=10,
+        cache_pressure_protect_recent_tokens=16_000,
+        cache_pressure_assistant_target_ratio=0.25,
+        cache_pressure_min_content_tokens=128,
         cache_pressure_trigger_ratio=0.85,
         cache_pressure_target_ratio=0.12,
         cache_pressure_max_output_ratio=0.65,
@@ -928,6 +952,10 @@ def test_cache_pressure_candidate_controls_prefix_overlay(
         assert pressure_pipeline_kwargs["compress_system_messages"] is False
         assert pressure_pipeline_kwargs["compress_assistant_text_blocks"] is True
         assert pressure_pipeline_kwargs["protect_recent_messages"] == 4
+        assert pressure_pipeline_kwargs["protect_recent_tokens"] == 16_000
+        assert pressure_pipeline_kwargs["assistant_target_ratio"] == 0.25
+        assert pressure_pipeline_kwargs["min_tokens_to_compress"] == 128
+        assert pressure_pipeline_kwargs["min_chars_for_block_compression"] == 512
         assert pressure_pipeline_kwargs["protect_recent"] == 0
         assert pressure_pipeline_kwargs["protect_analysis_context"] is False
         assert pressure_pipeline_kwargs["protect_reads"] is False

@@ -4659,6 +4659,69 @@ class ContentRouter(Transform):
             else:
                 self._request_local.state = previous_state
 
+    @staticmethod
+    def _pressure_compressible_message_tokens(message: dict[str, Any], tokenizer: Tokenizer) -> int:
+        """Count only content a pressure rewrite may lossy-compress.
+
+        Authority text and protocol blocks are protected elsewhere and must not
+        consume the hot-tail budget. Tool results embedded in user messages are
+        observations, so they do count.
+        """
+
+        def count_value(value: Any) -> int:
+            if isinstance(value, str):
+                return tokenizer.count_text(value)
+            if isinstance(value, list):
+                return sum(
+                    tokenizer.count_text(block.get("text", ""))
+                    for block in value
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                )
+            return 0
+
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return count_value(content) if role in {"assistant", "tool", "function"} else 0
+        if not isinstance(content, list):
+            return 0
+
+        total = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                total += count_value(block.get("content", ""))
+            elif block.get("type") == "text" and role == "assistant":
+                total += count_value(block.get("text", ""))
+        return total
+
+    def _pressure_token_tail_indices(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        token_budget: int,
+    ) -> set[int]:
+        """Return the newest contiguous compressible messages fitting a budget."""
+
+        if token_budget <= 0:
+            return set()
+        remaining = token_budget
+        protected: set[int] = set()
+        for index in range(len(messages) - 1, -1, -1):
+            tokens = self._pressure_compressible_message_tokens(messages[index], tokenizer)
+            if tokens <= 0:
+                continue
+            if tokens > remaining:
+                break
+            protected.add(index)
+            remaining -= tokens
+            if remaining <= 0:
+                break
+        return protected
+
     def _apply_request(
         self,
         messages: list[dict[str, Any]],
@@ -4733,6 +4796,8 @@ class ContentRouter(Transform):
             self.config.min_chars_for_block_compression,
         )
         protect_recent_messages = max(0, int(kwargs.get("protect_recent_messages", 0)))
+        protect_recent_tokens = max(0, int(kwargs.get("protect_recent_tokens", 0)))
+        assistant_target_ratio = kwargs.get("assistant_target_ratio")
         protected_tool_results = kwargs.get(
             "protect_tool_results",
             self.config.protect_tool_results,
@@ -4744,6 +4809,11 @@ class ContentRouter(Transform):
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
+        token_tail_indices = self._pressure_token_tail_indices(
+            messages,
+            tokenizer,
+            protect_recent_tokens,
+        )
 
         # Build tool name map for exclusion checking
         tool_name_map = self._build_tool_name_map(messages)
@@ -4975,7 +5045,7 @@ class ContentRouter(Transform):
                     netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
 
         # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, int, bool]
+        _PendingTask = tuple[int, str, str, float, int, bool, float | None]
         pending_tasks: list[_PendingTask] = []
 
         # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
@@ -5021,6 +5091,11 @@ class ContentRouter(Transform):
                 route_counts.setdefault("recent_message_protected", 0)
                 route_counts["recent_message_protected"] += 1
                 continue
+            if i in token_tail_indices:
+                result_slots[i] = message
+                route_counts.setdefault("recent_token_protected", 0)
+                route_counts["recent_token_protected"] += 1
+                continue
 
             # Handle list content (Anthropic format with content blocks)
             if isinstance(content, list):
@@ -5049,6 +5124,7 @@ class ContentRouter(Transform):
                     protect_tool_results=protected_tool_results,
                     protect_error_outputs=protect_error_outputs,
                     require_reversible_lossy=require_reversible_lossy,
+                    assistant_target_ratio=assistant_target_ratio,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -5256,7 +5332,12 @@ class ContentRouter(Transform):
             # Tier 2 (result): known compresses → reuse compressed text.
             # Key on the runtime target_ratio too: the same content compressed at
             # a different ratio is a different result, so it must not alias.
-            content_key = hash((content, getattr(self, "_runtime_target_ratio", None)))
+            content_target_ratio = (
+                assistant_target_ratio
+                if role == "assistant" and assistant_target_ratio is not None
+                else getattr(self, "_runtime_target_ratio", None)
+            )
+            content_key = hash((content, content_target_ratio))
             # Tool ground truth is gated against lossy-unrecoverable results below
             # (#1307). Partition its cache namespace so a gated tool entry is never
             # served from — or poisons — an ungated entry for byte-identical content.
@@ -5341,7 +5422,15 @@ class ContentRouter(Transform):
             route_counts.setdefault("cache_miss", 0)
             route_counts["cache_miss"] += 1
             pending_tasks.append(
-                (i, content, context, msg_bias, content_key, enforce_reversibility)
+                (
+                    i,
+                    content,
+                    context,
+                    msg_bias,
+                    content_key,
+                    enforce_reversibility,
+                    content_target_ratio,
+                )
             )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
@@ -5354,22 +5443,28 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, _, task_target_ratio in pending_tasks:
                     t0 = time.perf_counter()
                     deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
                     if deadline_s:
                         box: dict[str, Any] = {}
+                        task_request_state = self._worker_request_state()
+                        task_request_state.target_ratio = task_target_ratio
 
                         def _run(
                             _box: dict[str, Any] = box,
                             _content: str = task_content,
                             _context: str = task_ctx,
                             _bias: float = task_bias,
+                            _request_state: _ContentRouterRequestState = task_request_state,
                         ) -> None:
                             try:
-                                _box["result"] = self.compress(
-                                    _content, context=_context, bias=_bias
-                                )
+                                _box["result"] = self._timed_compress(
+                                    _content,
+                                    _context,
+                                    _bias,
+                                    _request_state,
+                                )[0]
                             except BaseException as exc:  # noqa: BLE001
                                 _box["error"] = exc
 
@@ -5395,21 +5490,38 @@ class ContentRouter(Transform):
                         else:
                             r = box["result"]
                     else:
-                        r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                        request_state = self._worker_request_state()
+                        request_state.target_ratio = task_target_ratio
+                        r = self._timed_compress(
+                            task_content,
+                            task_ctx,
+                            task_bias,
+                            request_state,
+                        )[0]
                     compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                    for (
+                        _,
+                        task_content,
+                        task_ctx,
+                        task_bias,
+                        _,
+                        _,
+                        task_target_ratio,
+                    ) in pending_tasks:
+                        request_state = self._worker_request_state()
+                        request_state.target_ratio = task_target_ratio
                         futures.append(
                             executor.submit(
                                 self._timed_compress,
                                 task_content,
                                 task_ctx,
                                 task_bias,
-                                self._worker_request_state(),
+                                request_state,
                             )
                         )
                     task_results = [f.result() for f in futures]
@@ -5418,7 +5530,7 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, task_content, _, _, content_key, enforce_rev), (
+            for (slot_idx, task_content, _, _, content_key, enforce_rev, _), (
                 result,
                 compress_ms,
             ) in zip(pending_tasks, task_results):
@@ -5921,6 +6033,7 @@ class ContentRouter(Transform):
         protect_tool_results: Any = None,
         protect_error_outputs: bool = True,
         require_reversible_lossy: bool = False,
+        assistant_target_ratio: float | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -6188,7 +6301,8 @@ class ContentRouter(Transform):
 
                     # Two-tier compression cache → shared helper
                     enforce_reversibility = True
-                    content_key = hash((tool_text, getattr(self, "_runtime_target_ratio", None)))
+                    tool_target_ratio = getattr(self, "_runtime_target_ratio", None)
+                    content_key = hash((tool_text, tool_target_ratio))
                     if enforce_reversibility:
                         content_key = hash((content_key, True))
                     compressed_content, was_compressed = self._compress_block_content(
@@ -6204,6 +6318,7 @@ class ContentRouter(Transform):
                         strategy_label="tool_result",
                         details_prefix="tool",
                         enforce_reversibility=enforce_reversibility,
+                        target_ratio=tool_target_ratio,
                     )
                     if compressed_content is not None:
                         new_blocks.append(
@@ -6250,7 +6365,12 @@ class ContentRouter(Transform):
                         continue
 
                     # Two-tier compression cache → shared helper
-                    content_key = hash((text_content, getattr(self, "_runtime_target_ratio", None)))
+                    text_target_ratio = (
+                        assistant_target_ratio
+                        if role == "assistant" and assistant_target_ratio is not None
+                        else getattr(self, "_runtime_target_ratio", None)
+                    )
+                    content_key = hash((text_content, text_target_ratio))
                     if require_reversible_lossy:
                         content_key = hash((content_key, True))
                     compressed_content, _was_compressed = self._compress_block_content(
@@ -6266,6 +6386,7 @@ class ContentRouter(Transform):
                         strategy_label="text_block",
                         details_prefix="text",
                         enforce_reversibility=require_reversible_lossy,
+                        target_ratio=text_target_ratio,
                     )
                     if compressed_content is not None:
                         new_blocks.append({**block, "text": compressed_content})
@@ -6298,6 +6419,7 @@ class ContentRouter(Transform):
         strategy_label: str,
         details_prefix: str,
         enforce_reversibility: bool = False,
+        target_ratio: float | None = None,
     ) -> tuple[str | None, bool]:
         """Apply two-tier cache lookup + compression to a single content string.
 
@@ -6401,7 +6523,14 @@ class ContentRouter(Transform):
         if route_counts is not None:
             route_counts["cache_miss"] = route_counts.get("cache_miss", 0) + 1
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
+        request_state = self._worker_request_state()
+        request_state.target_ratio = target_ratio
+        result = self._timed_compress(
+            content,
+            context,
+            bias,
+            request_state,
+        )[0]
         compress_ms = (time.perf_counter() - t0) * 1000
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"

@@ -889,7 +889,11 @@ class StreamingMixin:
         from headroom.proxy.outcome import RequestOutcome
 
         outcome_provider = outcome_provider or provider
-        total_latency = (time.time() - start_time) * 1000
+        # ``start_time`` begins when the upstream streaming stage starts, while
+        # ``optimization_latency`` covers request parsing/compression before it.
+        # They are disjoint. Adding them restores RequestOutcome's end-to-end
+        # contract and guarantees that overhead is a subset of total latency.
+        total_latency = optimization_latency + (time.time() - start_time) * 1000
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
         # When upstream truncates mid-event (client disconnect, network

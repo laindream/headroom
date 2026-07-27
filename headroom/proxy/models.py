@@ -185,6 +185,16 @@ class ProxyConfig:
     # typically two Claude Code tool cycles; older recoverable history can be
     # compressed aggressively while the active working set stays byte-identical.
     cache_pressure_protect_recent_messages: int = 4
+    # Optional token-budget hot tail. Zero preserves the legacy message-count
+    # behavior; deployments can set the message count to zero and use this
+    # budget to avoid one huge observation making the protected tail unbounded.
+    cache_pressure_protect_recent_tokens: int = 0
+    # Cold assistant prose carries more durable plans/decisions than old tool
+    # observations. None uses the common pressure target for both classes.
+    cache_pressure_assistant_target_ratio: float | None = None
+    # Lossy Kompress floor. Lossless folds remain eligible below it. Zero keeps
+    # the active savings profile's existing floor.
+    cache_pressure_min_content_tokens: int = 0
 
     # Strict coding-agent safety boundary. When enabled, lossy transforms may
     # mutate only old, explicitly allowlisted tool results. Unknown tools,
@@ -530,6 +540,15 @@ class ProxyConfig:
             raise ValueError("cache_pressure_cooldown_requests must be >= 0")
         if self.cache_pressure_protect_recent_messages < 0:
             raise ValueError("cache_pressure_protect_recent_messages must be >= 0")
+        if self.cache_pressure_protect_recent_tokens < 0:
+            raise ValueError("cache_pressure_protect_recent_tokens must be >= 0")
+        if (
+            self.cache_pressure_assistant_target_ratio is not None
+            and not 0 < self.cache_pressure_assistant_target_ratio <= 1
+        ):
+            raise ValueError("cache_pressure_assistant_target_ratio must be in (0, 1]")
+        if self.cache_pressure_min_content_tokens < 0:
+            raise ValueError("cache_pressure_min_content_tokens must be >= 0")
         # A 0 (or negative) requests-per-minute limit divides by zero in the
         # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
         # 500-ing every request. The CLI already guards this with IntRange(min=1);

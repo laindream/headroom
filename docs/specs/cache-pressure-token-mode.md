@@ -10,6 +10,9 @@ locally estimated appended tail for the trigger. Only after that trigger, use
 the configured Anthropic token-count endpoint for both the forwarded baseline
 and candidate. Generate the candidate with an explicit per-content target ratio
 and forced Kompress while retaining the active profile's safety protections.
+Protect the active working set by a bounded token budget, keep more cold
+assistant reasoning than replaceable tool observations, and skip lossy model
+work on blocks too small to amortize its latency and CCR marker overhead.
 
 ## Tech stack
 
@@ -31,6 +34,7 @@ ruff format --check headroom tests
 - `headroom/proxy/cache_pressure_policy.py`: pure threshold/acceptance policy
 - `headroom/proxy/handlers/anthropic.py`: upstream count call and request flow
 - `headroom/proxy/models.py`: opt-in configuration
+- `headroom/transforms/content_router.py`: hot-tail and value-tier routing
 - `tests/test_cache_pressure_token_mode.py`: policy and count-boundary tests
 
 ## Code style
@@ -60,6 +64,12 @@ authorize a cache-breaking rewrite.
 - Handler regression test proves requests below the pressure line do not call
   the count endpoint. Triggered requests record count-API baseline and
   candidate/baseline reduction without extra work.
+- Router tests prove that the protected tail is bounded by compressible tokens,
+  authority/protocol bytes do not consume that budget, assistant and tool
+  targets stay request-local under parallel compression, and an oversized tool
+  result remains CCR-compressible instead of expanding the hot tail.
+- Streaming finalizer tests prove compression overhead is included in total
+  request latency.
 - Run focused tests first, then existing Anthropic/cache-mode suites.
 
 ## Boundaries
@@ -77,6 +87,9 @@ authorize a cache-breaking rewrite.
 - Never: send credentials to a different host than configured Anthropic
   upstream; log auth header values; use Headroom's heuristic counter to
   authorize a prefix rewrite.
+- Always: preserve the configured request-count cooldown after an accepted
+  rewrite. Once it expires, the normal Claude-compatible threshold remains the
+  re-arm gate, so elapsed turns alone never authorize another rewrite.
 
 ## Success criteria
 
@@ -85,20 +98,30 @@ authorize a cache-breaking rewrite.
 - Below the configured trigger ratio, no count-API request is made.
 - At or above it, the candidate receives the configured pressure target ratio,
   forces Kompress, and is accepted only when
-  `candidate/original <= 0.65`.
+  the configured projected whole-request ratio (Armory uses `0.80`).
 - Count timeout/error/malformed response keeps cache-mode output.
 - `below_threshold` logs Claude-compatible trigger tokens and effective-window
   utilization. Accepted and insufficient-reduction decisions also log the
   count-API baseline, candidate tokens, and candidate/baseline ratio.
 - Accepted candidate is forwarded without old-prefix overlay; next request can
   freeze the newly forwarded prefix through existing tracker logic.
-- With a `372000` context window, trigger `0.85` fires at `299200` tokens:
-  `floor((372000 - 20000) * 0.85)`, before Claude's configured `0.95` line.
-- Armory pins the tested fork commit and enables trigger `0.85`, pressure target
-  `0.10`, and maximum whole-request output `0.65` for the local `gpt-5.6-sol`
-  profile.
+- With token-tail protection enabled, only the newest contiguous set of lossy-
+  eligible assistant/tool observations that fits the configured budget stays
+  exact. User/system text and tool protocol remain exact independently of that
+  budget; one oversized observation is compressed with CCR rather than silently
+  expanding the budget.
+- The pressure profile can use a safer assistant keep ratio than the common
+  tool-result ratio and can set a minimum lossy-content size; byte/data-lossless
+  folds remain eligible below that floor.
+- Streaming `total_latency_ms` includes `optimization_latency_ms`, maintaining
+  the invariant `total_latency_ms >= overhead_ms`.
+- With Armory's `270000` policy window, trigger `0.85` fires at `212500` tokens:
+  `floor((270000 - 20000) * 0.85)`, before Claude's configured `0.95` line.
+- Armory pins the tested fork commit and enables trigger `0.85`, tool-result
+  target `0.10`, assistant target `0.25`, maximum whole-request output `0.80`,
+  a `16000`-token hot tail, and a `128`-token lossy floor for the local
+  `gpt-5.6-sol` profile.
 
 ## Open questions
 
-None. Ratios remain configurable; Armory defaults are trigger `0.85`, pressure
-target `0.10`, maximum whole-request output `0.65`.
+None. Ratios and workload-dependent hot-tail/floor values remain configurable.

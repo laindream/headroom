@@ -126,6 +126,31 @@ async def test_finalize_stream_response_logs_request_for_feed():
 
 
 @pytest.mark.asyncio
+async def test_stream_total_latency_includes_compression_overhead(monkeypatch) -> None:
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    monkeypatch.setattr("headroom.proxy.handlers.streaming.time.time", lambda: 100.0)
+
+    await proxy._finalize_stream_response(
+        body={"messages": [{"role": "user", "content": "hi"}]},
+        provider="anthropic",
+        model="gpt-5.6-sol",
+        request_id="req-latency-invariant",
+        original_tokens=1000,
+        optimized_tokens=600,
+        tokens_saved=400,
+        transforms_applied=["cache_pressure:prefix_break"],
+        optimization_latency=35.0,
+        stream_state=_stream_state(),
+        start_time=99.990,
+    )
+
+    entry = proxy.logger.get_recent(1)[0]
+    assert entry["optimization_latency_ms"] == pytest.approx(35.0)
+    assert entry["total_latency_ms"] == pytest.approx(45.0)
+    assert entry["total_latency_ms"] >= entry["optimization_latency_ms"]
+
+
+@pytest.mark.asyncio
 async def test_finalize_stream_response_marks_estimated_output_tokens() -> None:
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
     state = _stream_state()

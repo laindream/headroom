@@ -5064,6 +5064,17 @@ def _proxy_config_from_env() -> ProxyConfig:
         cache_pressure_protect_recent_messages=_get_env_int(
             "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_MESSAGES", 4, min_value=0
         ),
+        cache_pressure_protect_recent_tokens=_get_env_int(
+            "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_TOKENS", 0, min_value=0
+        ),
+        cache_pressure_assistant_target_ratio=(
+            _get_env_float("HEADROOM_CACHE_PRESSURE_ASSISTANT_TARGET_RATIO", 0.25)
+            if os.environ.get("HEADROOM_CACHE_PRESSURE_ASSISTANT_TARGET_RATIO")
+            else None
+        ),
+        cache_pressure_min_content_tokens=_get_env_int(
+            "HEADROOM_CACHE_PRESSURE_MIN_CONTENT_TOKENS", 0, min_value=0
+        ),
         lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
         protect_recent_tool_result_turns=_get_env_int(
             "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS", 2
@@ -5806,6 +5817,17 @@ if __name__ == "__main__":
         ),
         cache_pressure_protect_recent_messages=_get_env_int(
             "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_MESSAGES", 4, min_value=0
+        ),
+        cache_pressure_protect_recent_tokens=_get_env_int(
+            "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_TOKENS", 0, min_value=0
+        ),
+        cache_pressure_assistant_target_ratio=(
+            _get_env_float("HEADROOM_CACHE_PRESSURE_ASSISTANT_TARGET_RATIO", 0.25)
+            if os.environ.get("HEADROOM_CACHE_PRESSURE_ASSISTANT_TARGET_RATIO")
+            else None
+        ),
+        cache_pressure_min_content_tokens=_get_env_int(
+            "HEADROOM_CACHE_PRESSURE_MIN_CONTENT_TOKENS", 0, min_value=0
         ),
         lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
         protect_recent_tool_result_turns=_get_env_int(

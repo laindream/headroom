@@ -62,6 +62,7 @@ def _cache_pressure_pipeline_kwargs(config: Any) -> dict[str, object]:
         # Preserve a small active tail; cold assistant/tool history is eligible.
         compress_assistant_text_blocks=True,
         protect_recent_messages=config.cache_pressure_protect_recent_messages,
+        protect_recent_tokens=config.cache_pressure_protect_recent_tokens,
         protect_recent=0,
         protect_analysis_context=False,
         # Default coding-agent exclusions still govern steady cache mode. A
@@ -73,6 +74,11 @@ def _cache_pressure_pipeline_kwargs(config: Any) -> dict[str, object]:
         # Never accept a lossy cold-history rewrite that cannot be redeemed.
         require_reversible_lossy=True,
     )
+    if config.cache_pressure_assistant_target_ratio is not None:
+        kwargs["assistant_target_ratio"] = config.cache_pressure_assistant_target_ratio
+    if config.cache_pressure_min_content_tokens > 0:
+        kwargs["min_tokens_to_compress"] = config.cache_pressure_min_content_tokens
+        kwargs["min_chars_for_block_compression"] = config.cache_pressure_min_content_tokens * 4
     return kwargs
 
 
