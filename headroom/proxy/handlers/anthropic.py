@@ -27,6 +27,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.tool_calls import should_handle_ccr_server_side
 from headroom.copilot_auth import build_copilot_upstream_url
+from headroom.mcp_tool_names import HEADROOM_RETRIEVE_TOOL_NAME
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.cache_pressure_policy import (
@@ -45,6 +46,34 @@ from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
+
+
+def _cache_pressure_pipeline_kwargs(config: Any) -> dict[str, object]:
+    """Return the value-aware aggressive profile used only for prefix rewrites."""
+
+    protected_recovery_tools = frozenset({HEADROOM_RETRIEVE_TOOL_NAME})
+    kwargs = proxy_pipeline_kwargs(config)
+    kwargs.update(
+        target_ratio=config.cache_pressure_target_ratio,
+        force_kompress=True,
+        # Authority and intent stay exact at every age.
+        compress_user_messages=False,
+        compress_system_messages=False,
+        # Preserve a small active tail; cold assistant/tool history is eligible.
+        compress_assistant_text_blocks=True,
+        protect_recent_messages=config.cache_pressure_protect_recent_messages,
+        protect_recent=0,
+        protect_analysis_context=False,
+        # Default coding-agent exclusions still govern steady cache mode. A
+        # pressure rewrite lifts them except for the CCR escape hatch.
+        exclude_tools=protected_recovery_tools,
+        protect_tool_results=protected_recovery_tools,
+        protect_reads=False,
+        protect_error_outputs=False,
+        # Never accept a lossy cold-history rewrite that cannot be redeemed.
+        require_reversible_lossy=True,
+    )
+    return kwargs
 
 
 def _strip_streaming_only_content_fields(messages: Any) -> None:
@@ -1779,11 +1808,7 @@ class AnthropicHandlerMixin:
                     if hasattr(prefix_tracker, "clear_cache_pressure_rejection"):
                         prefix_tracker.clear_cache_pressure_rejection()
                 else:
-                    pressure_pipeline_kwargs = proxy_pipeline_kwargs(self.config)
-                    pressure_pipeline_kwargs.update(
-                        target_ratio=self.config.cache_pressure_target_ratio,
-                        force_kompress=True,
-                    )
+                    pressure_pipeline_kwargs = _cache_pressure_pipeline_kwargs(self.config)
                     pressure_protect_recent_tool_result_turns = int(
                         pressure_pipeline_kwargs.get(
                             "protect_recent_tool_result_turns",
@@ -3215,11 +3240,7 @@ class AnthropicHandlerMixin:
                         from headroom.transforms.compression_policy import resolve_policy
 
                         rescue_policy = resolve_policy(getattr(request.state, "auth_mode", None))
-                        rescue_pipeline_kwargs = proxy_pipeline_kwargs(self.config)
-                        rescue_pipeline_kwargs.update(
-                            target_ratio=self.config.cache_pressure_target_ratio,
-                            force_kompress=True,
-                        )
+                        rescue_pipeline_kwargs = _cache_pressure_pipeline_kwargs(self.config)
                         rescue_biases = (
                             self.config.hooks.compute_biases(current_messages, _hook_ctx)
                             if self.config.hooks and _hook_ctx is not None

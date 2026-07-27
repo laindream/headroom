@@ -181,6 +181,10 @@ class ProxyConfig:
     cache_pressure_max_output_ratio: float = 0.50
     cache_pressure_count_timeout_seconds: float = 5.0
     cache_pressure_cooldown_requests: int = 10
+    # Exact hot tail retained during a pressure rewrite. Four wire messages are
+    # typically two Claude Code tool cycles; older recoverable history can be
+    # compressed aggressively while the active working set stays byte-identical.
+    cache_pressure_protect_recent_messages: int = 4
 
     # Strict coding-agent safety boundary. When enabled, lossy transforms may
     # mutate only old, explicitly allowlisted tool results. Unknown tools,
@@ -524,6 +528,8 @@ class ProxyConfig:
             raise ValueError("cache_pressure_count_timeout_seconds must be > 0")
         if self.cache_pressure_cooldown_requests < 0:
             raise ValueError("cache_pressure_cooldown_requests must be >= 0")
+        if self.cache_pressure_protect_recent_messages < 0:
+            raise ValueError("cache_pressure_protect_recent_messages must be >= 0")
         # A 0 (or negative) requests-per-minute limit divides by zero in the
         # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
         # 500-ing every request. The CLI already guards this with IntRange(min=1);

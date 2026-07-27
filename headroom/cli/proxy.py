@@ -1205,6 +1205,9 @@ def proxy(
         cache_pressure_cooldown_requests=_get_env_int(
             "HEADROOM_CACHE_PRESSURE_COOLDOWN_REQUESTS", 10
         ),
+        cache_pressure_protect_recent_messages=_get_env_int(
+            "HEADROOM_CACHE_PRESSURE_PROTECT_RECENT_MESSAGES", 4
+        ),
         lossy_tool_results_only=_get_env_bool("HEADROOM_LOSSY_TOOL_RESULTS_ONLY", False),
         protect_recent_tool_result_turns=_get_env_int(
             "HEADROOM_PROTECT_RECENT_TOOL_RESULT_TURNS", 2

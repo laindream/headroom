@@ -58,6 +58,7 @@ from ..config import (
     TransformResult,
     is_tool_excluded,
 )
+from ..mcp_tool_names import HEADROOM_RETRIEVE_TOOL_NAME, is_headroom_mcp_tool_name
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from ..tokenizers.estimator import EstimatingTokenCounter
@@ -83,6 +84,16 @@ from .mixed_content import ContentSection, mixed_content_indicators
 from .relevance_split import build_relevance_query, plan_relevance_split
 
 logger = logging.getLogger(__name__)
+
+
+def _must_preserve_tool_result(tool_name: str, protected_tools: Any) -> bool:
+    """Protect configured control results and the CCR recovery channel."""
+
+    return is_headroom_mcp_tool_name(
+        tool_name,
+        HEADROOM_RETRIEVE_TOOL_NAME,
+    ) or is_tool_excluded(tool_name, protected_tools)
+
 
 _extract_json_block = _mixed_content._extract_json_block
 is_mixed_content = _mixed_content.is_mixed_content
@@ -4686,8 +4697,11 @@ class ContentRouter(Transform):
 
         # Runtime overrides from CompressConfig (via kwargs from compress())
         # These override self.config defaults for this call only.
+        compress_user_override = kwargs.get("compress_user_messages")
         skip_user = (
-            kwargs.get("compress_user_messages") is not True and self.config.skip_user_messages
+            self.config.skip_user_messages
+            if compress_user_override is None
+            else compress_user_override is not True
         )
         skip_system = kwargs.get("compress_system_messages") is not True
         protect_recent = kwargs.get("protect_recent", self.config.protect_recent_code)
@@ -4704,6 +4718,15 @@ class ContentRouter(Transform):
             "min_chars_for_block_compression",
             self.config.min_chars_for_block_compression,
         )
+        protect_recent_messages = max(0, int(kwargs.get("protect_recent_messages", 0)))
+        protected_tool_results = kwargs.get(
+            "protect_tool_results",
+            self.config.protect_tool_results,
+        )
+        protect_error_outputs = bool(
+            kwargs.get("protect_error_outputs", self.config.protect_error_outputs)
+        )
+        require_reversible_lossy = bool(kwargs.get("require_reversible_lossy", False))
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
@@ -4712,8 +4735,11 @@ class ContentRouter(Transform):
         tool_name_map = self._build_tool_name_map(messages)
 
         # Compute excluded tool IDs based on config
+        request_exclude_tools = kwargs.get("exclude_tools")
         exclude_tools = (
-            self.config.exclude_tools
+            request_exclude_tools
+            if request_exclude_tools is not None
+            else self.config.exclude_tools
             if self.config.exclude_tools is not None
             else DEFAULT_EXCLUDE_TOOLS
         )
@@ -4730,13 +4756,17 @@ class ContentRouter(Transform):
         # lossy reads caused re-reads/turn-inflation + resolve loss on SWE-bench).
         # Type-specific by design: grep/test/ls output stays compressible, so the
         # cache-mode delta still compresses whenever the newest turn is NOT a read.
-        self._protect_read_tool_ids = set()
-        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
+        configured_protect_reads = os.environ.get(
+            "HEADROOM_PROTECT_READS", "0"
+        ).strip().lower() not in (
             "0",
             "",
             "false",
             "no",
-        ):
+        )
+        protect_reads = bool(kwargs.get("protect_reads", configured_protect_reads))
+        self._protect_read_tool_ids = set()
+        if protect_reads:
             # Use _tool_call_commands (the parsed shell command), NOT
             # _tool_call_args (a compact free-text blob that, for OpenAI-style
             # JSON-string args, is the raw ``{"command": ...}`` JSON — on which
@@ -4759,12 +4789,7 @@ class ContentRouter(Transform):
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
         self._protect_read_msg_indices: set[int] = set()
-        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
-            "0",
-            "",
-            "false",
-            "no",
-        ):
+        if protect_reads:
             for _idx, _m in enumerate(messages):
                 if _m.get("role") != "user":
                     continue
@@ -4974,6 +4999,15 @@ class ContentRouter(Transform):
 
             messages_from_end = num_messages - i
 
+            # Exact hot tail for a pressure rewrite. This is deliberately
+            # bounded: the active working set stays intact while older,
+            # CCR-recoverable history remains eligible for compression.
+            if protect_recent_messages > 0 and messages_from_end <= protect_recent_messages:
+                result_slots[i] = message
+                route_counts.setdefault("recent_message_protected", 0)
+                route_counts["recent_message_protected"] += 1
+                continue
+
             # Handle list content (Anthropic format with content blocks)
             if isinstance(content, list):
                 transformed_message = self._process_content_blocks(
@@ -4998,6 +5032,9 @@ class ContentRouter(Transform):
                         for message_idx, block_idx in strict_allowed_blocks
                         if message_idx == i
                     },
+                    protect_tool_results=protected_tool_results,
+                    protect_error_outputs=protect_error_outputs,
+                    require_reversible_lossy=require_reversible_lossy,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -5028,10 +5065,15 @@ class ContentRouter(Transform):
                 protected_tool_name = tool_name_map.get(protected_tool_call_id) or str(
                     message.get("name") or ""
                 )
-                if is_tool_excluded(protected_tool_name, self.config.protect_tool_results):
+                if _must_preserve_tool_result(protected_tool_name, protected_tool_results):
                     result_slots[i] = message
                     route_counts.setdefault("protected_tool_result", 0)
                     route_counts["protected_tool_result"] += 1
+                    if is_headroom_mcp_tool_name(
+                        protected_tool_name,
+                        HEADROOM_RETRIEVE_TOOL_NAME,
+                    ):
+                        transforms_applied.append("router:protected:ccr_retrieve_result")
                     continue
 
             # Skip OpenAI-style tool messages for excluded tools
@@ -5143,7 +5185,7 @@ class ContentRouter(Transform):
             # errors. Above the size cap, fall through — LogCompressor
             # preserves error lines in big logs.
             if (
-                self.config.protect_error_outputs
+                protect_error_outputs
                 and role == "tool"
                 and len(content) <= self.config.error_protection_max_chars
                 and content_has_strong_error_indicators(content)
@@ -5204,7 +5246,7 @@ class ContentRouter(Transform):
             # Tool ground truth is gated against lossy-unrecoverable results below
             # (#1307). Partition its cache namespace so a gated tool entry is never
             # served from — or poisons — an ungated entry for byte-identical content.
-            enforce_reversibility = role in {"tool", "function"}
+            enforce_reversibility = role in {"tool", "function"} or require_reversible_lossy
             if enforce_reversibility:
                 content_key = hash((content_key, True))
 
@@ -5862,6 +5904,9 @@ class ContentRouter(Transform):
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
         strict_allowed_tool_result_blocks: set[int] | None = None,
+        protect_tool_results: Any = None,
+        protect_error_outputs: bool = True,
+        require_reversible_lossy: bool = False,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -5954,11 +5999,13 @@ class ContentRouter(Transform):
                 # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
                 tool_name = (tool_name_map or {}).get(tool_use_id, "")
-                if is_tool_excluded(tool_name, self.config.protect_tool_results):
+                if _must_preserve_tool_result(tool_name, protect_tool_results):
                     new_blocks.append(block)
                     if route_counts is not None:
                         route_counts.setdefault("protected_tool_result", 0)
                         route_counts["protected_tool_result"] += 1
+                    if is_headroom_mcp_tool_name(tool_name, HEADROOM_RETRIEVE_TOOL_NAME):
+                        transforms_applied.append("router:protected:ccr_retrieve_result")
                     continue
                 # Flatten OpenAI-style list-form content up front (see fix-7 note below)
                 # so both the read-protection content check and the compressor see the
@@ -6093,7 +6140,7 @@ class ContentRouter(Transform):
                 # Above the size cap, fall through — LogCompressor preserves
                 # error lines in big logs.
                 if (
-                    self.config.protect_error_outputs
+                    protect_error_outputs
                     and isinstance(tool_text, str)
                     and len(tool_text) <= self.config.error_protection_max_chars
                     and (
@@ -6126,9 +6173,13 @@ class ContentRouter(Transform):
                         continue
 
                     # Two-tier compression cache → shared helper
+                    enforce_reversibility = True
+                    content_key = hash((tool_text, getattr(self, "_runtime_target_ratio", None)))
+                    if enforce_reversibility:
+                        content_key = hash((content_key, True))
                     compressed_content, was_compressed = self._compress_block_content(
                         content=tool_text,
-                        content_key=hash((tool_text, getattr(self, "_runtime_target_ratio", None))),
+                        content_key=content_key,
                         context=block_context,
                         bias=bias,
                         min_ratio=min_ratio,
@@ -6138,7 +6189,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="tool_result",
                         details_prefix="tool",
-                        enforce_reversibility=True,
+                        enforce_reversibility=enforce_reversibility,
                     )
                     if compressed_content is not None:
                         new_blocks.append(
@@ -6185,11 +6236,12 @@ class ContentRouter(Transform):
                         continue
 
                     # Two-tier compression cache → shared helper
+                    content_key = hash((text_content, getattr(self, "_runtime_target_ratio", None)))
+                    if require_reversible_lossy:
+                        content_key = hash((content_key, True))
                     compressed_content, _was_compressed = self._compress_block_content(
                         content=text_content,
-                        content_key=hash(
-                            (text_content, getattr(self, "_runtime_target_ratio", None))
-                        ),
+                        content_key=content_key,
                         context=context,
                         bias=1.0,
                         min_ratio=min_ratio,
@@ -6199,6 +6251,7 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="text_block",
                         details_prefix="text",
+                        enforce_reversibility=require_reversible_lossy,
                     )
                     if compressed_content is not None:
                         new_blocks.append({**block, "text": compressed_content})
